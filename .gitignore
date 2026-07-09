@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+models/
+data/known_faces/
+data/currency_model/
+.vscode/
