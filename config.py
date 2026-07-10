@@ -7,10 +7,15 @@ CONFIG = {
 
     # Object Detection Settings
     "yolo_model": "yolo11m.pt",
-    "confidence_threshold": 0.5,
-    "detection_classes": None,  # None = detect all classes
+    "confidence_threshold": 0.65,
+    "detection_classes": None,
 
     # Depth Estimation Settings
-    "midas_model": "MiDaS_small",  # Fast, good enough for real-time
-    "depth_max_display": 10.0,     # Values beyond this treated as "far"
+    "midas_model": "MiDaS_small",
+    "depth_max_display": 10.0,
+
+    # Decision Engine Settings
+    "danger_classes": ["car", "truck", "bus", "motorcycle", "bicycle"],
+    "warning_cooldown_seconds": 2,
+    "max_repeats": 5,
 }
