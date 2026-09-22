@@ -1,12 +1,12 @@
 CONFIG = {
     # ESP32 Stream Settings
-    "stream_url": "http://10.26.199.220/stream",
+    "stream_url": "http://192.168.0.113/stream",
     "stream_timeout": 10,
     "display_width": 800,
     "display_height": 600,
 
     # Object Detection Settings
-    "yolo_model": "yolo11m.pt",
+    "yolo_model": "yolov8n.pt",
     "confidence_threshold": 0.65,
     "detection_classes": None,
 

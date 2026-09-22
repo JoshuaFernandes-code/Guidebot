@@ -3,8 +3,8 @@
 #include "esp_http_server.h"
 
 // WiFi credentials
-const char* ssid = "Joshua";
-const char* password = "87654321";
+const char* ssid = "JORDAN";
+const char* password = "sweethome";
 
 // XIAO ESP32S3 Sense camera pins
 #define PWDN_GPIO_NUM     -1
