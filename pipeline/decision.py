@@ -9,47 +9,37 @@ class DecisionEngine:
     def _can_speak(self, key, now):
         if key not in self.last_spoken:
             return True, 0
-
         last_time, count, last_seen = self.last_spoken[key]
-
         if now - last_seen > self.reset_after_seconds:
             return True, 0
-
         if count >= CONFIG["max_repeats"]:
             return False, count
-
         if now - last_time < CONFIG["warning_cooldown_seconds"]:
             return False, count
-
         return True, count
 
     def decide(self, detections):
-        now = time.time()
-        messages = []
-        seen_this_frame = set()
+        # Auto-announce disabled — GuideBot now speaks only when asked.
+        return []
 
-        for det in detections:
-            label = det["label"]
-            distance = det["distance"]
+    def get_direction(self, x1, x2, frame_width):
+        center_x = (x1 + x2) / 2
+        third = frame_width / 3
+        if center_x < third:
+            return "left"
+        elif center_x > third * 2:
+            return "right"
+        else:
+            return "ahead"
 
-            if distance not in ("Close", "Medium"):
-                continue
+    def answer_query(self, query, detections, frame_width):
+        matches = [d for d in detections if d["direction"] == query]
 
-            key = f"{label}_{distance}"
-            if key in seen_this_frame:
-                continue
-            seen_this_frame.add(key)
+        if not matches:
+            return f"nothing detected to your {query}" if query != "ahead" else "nothing detected ahead"
 
-            allowed, count = self._can_speak(key, now)
-
-            if allowed:
-                self.last_spoken[key] = (now, count + 1, now)
-                if distance == "Close":
-                    messages.append(f"{label} very close")
-                else:
-                    messages.append(f"{label} ahead, caution")
-            else:
-                last_time, c, _ = self.last_spoken[key]
-                self.last_spoken[key] = (last_time, c, now)
-
-        return messages
+        closest = matches[0]
+        if query != "ahead":
+            return f"{closest['label']} is {closest['distance'].lower()} to your {query}"
+        else:
+            return f"{closest['label']} is {closest['distance'].lower()} ahead"

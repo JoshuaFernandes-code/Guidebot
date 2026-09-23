@@ -18,4 +18,10 @@ CONFIG = {
     "danger_classes": ["car", "truck", "bus", "motorcycle", "bicycle"],
     "warning_cooldown_seconds": 2,
     "max_repeats": 5,
+
+    # Voice Command Settings
+    "whisper_model": "base",
+    "voice_sample_rate": 16000,
+    "voice_record_seconds": 3,
+    "wake_check_interval": 0.5,
 }
