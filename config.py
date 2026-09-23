@@ -1,6 +1,6 @@
 CONFIG = {
     # ESP32 Stream Settings
-    "stream_url": "http://10.26.199.220/stream",
+    "stream_url": "http://192.168.0.113/stream",
     "stream_timeout": 10,
     "display_width": 800,
     "display_height": 600,
@@ -24,4 +24,8 @@ CONFIG = {
     "voice_sample_rate": 16000,
     "voice_record_seconds": 3,
     "wake_check_interval": 0.5,
+
+    # OCR Settings
+    "ocr_languages": ["en"],
+    "ocr_min_confidence": 0.4,
 }

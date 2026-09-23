@@ -4,18 +4,20 @@ from pipeline.stream import Stream
 from pipeline.detection import Detector
 from pipeline.depth import DepthEstimator
 from pipeline.decision import DecisionEngine
+from pipeline.ocr import OCRReader
 from audio.tts import TTS
 from audio.voice_input import VoiceInput
 from config import CONFIG
 
 def main():
-    print("[GuideBot] Starting - Phase 5 (Voice Commands)")
+    print("[GuideBot] Starting - Phase 6 (OCR)")
     stream = Stream()
     detector = Detector()
     depth_estimator = DepthEstimator()
     decision_engine = DecisionEngine()
     tts = TTS()
     voice_input = VoiceInput()
+    ocr_reader = OCRReader()
 
     cv2.namedWindow("GuideBot", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("GuideBot", CONFIG["display_width"], CONFIG["display_height"])
@@ -57,6 +59,11 @@ def main():
                 cv2.putText(annotated_frame, text, (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
+            messages = decision_engine.decide(detections)
+            for message in messages:
+                print(f"[GuideBot Speaking] {message}")
+                tts.speak(message)
+
             command = voice_input.get_command()
             if command:
                 query = None
@@ -71,6 +78,11 @@ def main():
                     response = decision_engine.answer_query(query, detections, frame_width)
                     print(f"[GuideBot Speaking] {response}")
                     tts.speak(response)
+                elif "read" in command:
+                    print("[OCR] Reading current frame...")
+                    text_result = ocr_reader.read_frame(frame)
+                    print(f"[GuideBot Speaking] {text_result}")
+                    tts.speak(text_result)
                 else:
                     print(f"[Voice] Command not recognized: '{command}'")
 
