@@ -1,6 +1,6 @@
 CONFIG = {
     # ESP32 Stream Settings
-    "stream_url": "http://192.168.0.113/stream",
+    "stream_url": "http://10.26.199.220/stream",
     "stream_timeout": 10,
     "display_width": 800,
     "display_height": 600,
@@ -16,8 +16,8 @@ CONFIG = {
 
     # Decision Engine Settings
     "danger_classes": ["car", "truck", "bus", "motorcycle", "bicycle"],
-    "warning_cooldown_seconds": 2,
-    "max_repeats": 5,
+    "warning_cooldown_seconds": 4,
+    "max_repeats": 1,
 
     # Voice Command Settings
     "whisper_model": "base",

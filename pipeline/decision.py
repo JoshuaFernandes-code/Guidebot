@@ -19,8 +19,26 @@ class DecisionEngine:
         return True, count
 
     def decide(self, detections):
-        # Auto-announce disabled — GuideBot now speaks only when asked.
-        return []
+        now = time.time()
+        danger_classes = CONFIG["danger_classes"]
+        messages = []
+
+        for det in detections:
+            label = det["label"]
+            distance = det["distance"]
+            is_danger = label in danger_classes
+
+            if not is_danger or distance != "Close":
+                continue
+
+            key = f"{label}_{distance}"
+            allowed, count = self._can_speak(key, now)
+
+            if allowed:
+                self.last_spoken[key] = (now, count + 1, now)
+                messages.append(f"warning, {label} very close")
+
+        return messages
 
     def get_direction(self, x1, x2, frame_width):
         center_x = (x1 + x2) / 2
