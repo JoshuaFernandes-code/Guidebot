@@ -5,12 +5,13 @@ from pipeline.detection import Detector
 from pipeline.depth import DepthEstimator
 from pipeline.decision import DecisionEngine
 from pipeline.ocr import OCRReader
+from pipeline.face import FaceRecognizer
 from audio.tts import TTS
 from audio.voice_input import VoiceInput
 from config import CONFIG
 
 def main():
-    print("[GuideBot] Starting - Phase 6 (OCR)")
+    print("[GuideBot] Starting - Phase 6C (Face Recognition)")
     stream = Stream()
     detector = Detector()
     depth_estimator = DepthEstimator()
@@ -18,6 +19,7 @@ def main():
     tts = TTS()
     voice_input = VoiceInput()
     ocr_reader = OCRReader()
+    face_recognizer = FaceRecognizer()
 
     cv2.namedWindow("GuideBot", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("GuideBot", CONFIG["display_width"], CONFIG["display_height"])
@@ -83,6 +85,11 @@ def main():
                     text_result = ocr_reader.read_frame(frame)
                     print(f"[GuideBot Speaking] {text_result}")
                     tts.speak(text_result)
+                elif "who" in command:
+                    print("[Face] Identifying...")
+                    face_result = face_recognizer.identify(frame)
+                    print(f"[GuideBot Speaking] {face_result}")
+                    tts.speak(face_result)
                 else:
                     print(f"[Voice] Command not recognized: '{command}'")
 

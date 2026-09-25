@@ -28,4 +28,7 @@ CONFIG = {
     # OCR Settings
     "ocr_languages": ["en"],
     "ocr_min_confidence": 0.4,
+
+    # Face Recognition Settings
+    "face_similarity_threshold": 0.5,
 }
