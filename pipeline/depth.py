@@ -6,18 +6,19 @@ from config import CONFIG
 class DepthEstimator:
     def __init__(self):
         print(f"[Depth] Loading {CONFIG['midas_model']}...")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = torch.hub.load("intel-isl/MiDaS", CONFIG["midas_model"])
-        self.model.to("cuda")
+        self.model.to(self.device)
         self.model.eval()
 
         midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
         self.transform = midas_transforms.small_transform
 
-        print("[Depth] Model loaded on GPU")
+        print(f"[Depth] Model loaded on {self.device.upper()}")
 
     def estimate(self, frame):
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        input_batch = self.transform(img_rgb).to("cuda")
+        input_batch = self.transform(img_rgb).to(self.device)
 
         with torch.no_grad():
             prediction = self.model(input_batch)
