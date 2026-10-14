@@ -1,6 +1,6 @@
 CONFIG = {
     # ESP32 Stream Settings
-    "stream_url": "http://192.168.0.113/stream",
+    "stream_url": "http://10.254.76.220/stream",
     "stream_timeout": 10,
     "display_width": 800,
     "display_height": 600,
