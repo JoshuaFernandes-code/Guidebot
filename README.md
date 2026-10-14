@@ -43,10 +43,10 @@ Python, OpenCV, YOLOv11 (Ultralytics), MiDaS, pyttsx3, Arduino (ESP32-S3)
 - [x] Object detection
 - [x] Depth estimation
 - [x] Decision engine + audio feedback
-- [ ] Voice commands
-- [ ] Text reading (OCR)
+- [x] Voice commands
+- [x] Text reading (OCR)
 - [ ] Currency recognition
-- [ ] Face recognition
+- [x] Face recognition
 - [ ] Scene description
 - [ ] Final polish + wearable build
 
@@ -54,4 +54,4 @@ Python, OpenCV, YOLOv11 (Ultralytics), MiDaS, pyttsx3, Arduino (ESP32-S3)
 
 ## Author
 
-Joshua Fernandes — B.E. Electronics and Computer Engineering, Agnel Institute of Technology and Design, Goa University
+Joshua Fernandes — B.E. Electronics and Computer Engineering, Agnel Institute of Engineering and Management, Goa University
