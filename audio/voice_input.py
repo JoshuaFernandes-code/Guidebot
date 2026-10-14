@@ -35,15 +35,14 @@ class VoiceInput:
         return audio.flatten()
 
     def _listen_loop(self):
+        fail_count = 0
         while self.running:
             try:
                 audio = self._record_audio()
+                fail_count = 0
                 volume = np.abs(audio).mean()
 
-                print(f"[Voice] Captured audio — volume level: {volume:.4f}")
-
                 if volume < 0.003:
-                    print("[Voice] Too quiet, skipping transcription")
                     continue
 
                 result = self.model.transcribe(audio, fp16=False, language="en")
@@ -52,11 +51,15 @@ class VoiceInput:
                 if text:
                     print(f"[Voice] Heard: '{text}'")
                     self.command_queue.put(text)
-                else:
-                    print("[Voice] Transcribed but got empty text")
 
             except Exception as e:
-                print(f"[Voice] Error: {e}")
+                fail_count += 1
+                # Only print the first occurrence, then once every 10 failures
+                if fail_count == 1 or fail_count % 10 == 0:
+                    print(f"[Voice] Microphone error (attempt {fail_count}): {e}")
+                # Backoff: cap at 5s so recovery is quick when mic becomes available
+                import time
+                time.sleep(min(fail_count * 0.5, 5.0))
 
     def get_command(self):
         try:
