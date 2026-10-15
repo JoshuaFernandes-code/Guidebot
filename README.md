@@ -14,7 +14,9 @@ An AI-powered wearable navigation assistant for people who are blind or losing t
 - **Object Detection:** Real-time object recognition (YOLOv8/v11).
 - **Depth Estimation:** Distance estimation classified into Close / Medium / Far (MiDaS).
 - **Audio & Spoken Alerts:** Spoken hazard warnings with directional cues (pyttsx3).
-- **Voice Commands:** Spoken queries for navigation guidance (OpenAI Whisper).
+- **Voice Commands:** Spoken queries for navigation guidance (OpenAI Whisper) via host microphone or browser Web Audio interface (`/audio`).
+- **Remote ESP Management Dashboard (`/esp`):** Scan & switch Wi-Fi networks, reboot, and wipe credentials into hotspot mode remotely over the tunnel without physical access.
+- **Captive Portal Wi-Fi Provisioning:** Setup hotspot (`GuideBot-Setup` at `192.168.4.1` / `http://guidebot.local`) for credential configuration with hidden tokens and eye visibility toggles.
 - **Text Reading (OCR):** Reads signs and text on demand (EasyOCR).
 - **Face Recognition:** Identifies known individuals (InsightFace).
 
@@ -102,6 +104,10 @@ STREAM_AUTH_TOKEN=guidebot_secret_token
 # Set to true to always force VGA (640x480) even if network speed drops.
 # Set to false (default) to let the ESP32 dynamically adapt to QVGA (320x240) on slow networks.
 FORCE_HIGH_RES=false
+
+# Set to true to enable the browser-based Web Voice & Command interface at /audio
+# and disable the local PC microphone thread (solves PortAudio [PaErrorCode -9999] on Windows).
+USE_WEB_MIC=false
 ```
 
 ---
@@ -137,16 +143,24 @@ If you are testing on the same local Wi-Fi without any tunnel:
    ```cmd
    copy esp32\guidebot_stream\secrets.h.example esp32\guidebot_stream\secrets.h
    ```
-2. Open `esp32/guidebot_stream/secrets.h` and update:
-   - `SECRET_SSID` and `SECRET_PASSWORD` (your Wi-Fi or phone hotspot)
+2. Open `esp32/guidebot_stream/secrets.h` and configure default fallbacks:
    - `SECRET_SERVER_HOST` (your Cloudflare subdomain or devtunnel host, e.g. `"stream.yourdomain.com"`)
    - `SECRET_AUTH_TOKEN` (must match `STREAM_AUTH_TOKEN` in your `.env`)
+   *(Note: Wi-Fi credentials are no longer hardcoded! They are provisioned dynamically via the GuideBot setup portal).*
 3. Open `esp32/guidebot_stream/guidebot_stream.ino` in **Arduino IDE**.
 4. In Arduino IDE, install the required library:
    - Go to **Sketch** -> **Include Library** -> **Manage Libraries...**
    - Search for **WebSockets** by **Markus Sattler** and click **Install**.
-5. Select Board: **Seeed XIAO ESP32S3** (and the matching COM port).
+5. Select Board: **XIAO_ESP32S3** (and the matching COM port).
+   - **PSRAM:** `OPI PSRAM` *(Critical: Must be enabled for camera buffers)*
+   - **Flash Mode:** `QIO 80MHz`
+   - **USB CDC On Boot:** `Enabled`
 6. Click **Upload**.
+7. **Wi-Fi Setup via Captive Portal:**
+   - On first boot (or after an erase), the ESP32 launches an open hotspot: **`GuideBot-Setup`**.
+   - Connect your phone or laptop to `GuideBot-Setup` and open `http://192.168.4.1` (or `http://guidebot.local`).
+   - Pick your Wi-Fi network, enter the password, and save. The ESP32 saves credentials to NVS flash and automatically begins streaming to your server.
+   - You can later switch networks, reboot, or wipe credentials remotely anytime via `http://<server-host>/esp`.
 
 ---
 

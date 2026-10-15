@@ -35,6 +35,7 @@ CONFIG = {
     "max_repeats": 1,
 
     # Voice Command Settings
+    "use_web_mic": os.getenv("USE_WEB_MIC", "false").strip().lower() in ("1", "true", "yes"),
     "whisper_model": "base",
     "voice_sample_rate": 16000,
     "voice_record_seconds": 3,

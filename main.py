@@ -147,12 +147,12 @@ def draw_standby_screen(w: int, h: int, stream: Stream):
 
 def main():
     print("[GuideBot] Starting - Phase 6C (Face Recognition)")
-    stream          = Stream()
+    voice_input     = VoiceInput()
+    stream          = Stream(voice_input=voice_input)
     detector        = Detector()
     depth_estimator = DepthEstimator()
     decision_engine = DecisionEngine()
     tts             = TTS()
-    voice_input     = VoiceInput()
     ocr_reader      = OCRReader()
     face_recognizer = FaceRecognizer()
 

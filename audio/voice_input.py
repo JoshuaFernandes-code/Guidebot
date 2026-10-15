@@ -11,15 +11,44 @@ class VoiceInput:
         self.model = whisper.load_model(CONFIG["whisper_model"])
         print("[Voice] Whisper loaded")
 
-        devices = sd.query_devices()
-        default_input = sd.default.device[0]
-        print(f"[Voice] Default input device: {devices[default_input]['name']}")
-
         self.command_queue = queue.Queue()
         self.running = True
+        self.use_web_mic = CONFIG.get("use_web_mic", False)
 
-        self.thread = threading.Thread(target=self._listen_loop, daemon=True)
-        self.thread.start()
+        if self.use_web_mic:
+            print("[Voice] USE_WEB_MIC=true: Local microphone disabled. Commands accepted via Web UI at /audio.")
+            self.thread = None
+        else:
+            try:
+                devices = sd.query_devices()
+                default_input = sd.default.device[0]
+                print(f"[Voice] Default input device: {devices[default_input]['name']}")
+            except Exception as e:
+                print(f"[Voice] Warning: Could not query local audio devices: {e}")
+
+            self.thread = threading.Thread(target=self._listen_loop, daemon=True)
+            self.thread.start()
+
+    def submit_command(self, text: str):
+        """Allows web interface or external callers to inject a command."""
+        text = text.strip().lower()
+        if text:
+            print(f"[Voice / Web] Command received: '{text}'")
+            self.command_queue.put(text)
+
+    def transcribe_audio_file(self, file_path_or_bytes):
+        """Transcribe an audio recording received from the web interface."""
+        try:
+            result = self.model.transcribe(file_path_or_bytes, fp16=False, language="en")
+            text = result["text"].strip().lower()
+            if text:
+                print(f"[Voice / Web] Transcribed audio: '{text}'")
+                self.command_queue.put(text)
+                return text
+            return ""
+        except Exception as e:
+            print(f"[Voice / Web] Transcription error: {e}")
+            return ""
 
     def _record_audio(self):
         sample_rate = CONFIG["voice_sample_rate"]
