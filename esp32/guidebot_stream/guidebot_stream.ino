@@ -243,6 +243,7 @@ void checkAdaptiveResolution() {
           case WStype_CONNECTED:
               is_connected = true;
               Serial.printf("[WS] Connected to: %s\n", payload);
+              webSocket.sendTXT("DEVICE_INFO:{\"ssid\":\"" + config_ssid + "\"}");
               break;
           case WStype_TEXT: {
               // Convert payload safely using exact length to avoid reading beyond buffer
@@ -378,12 +379,81 @@ void handlePortalRoot() {
     html += ".eye-btn:hover { opacity:0.8; }";
     html += "</style>";
     html += "<script>";
-    html += "function onSsidChange(sel){var c=document.getElementById('custom_ssid_box');c.style.display=(sel.value==='__custom__')?'block':'none';}";
+    html += "function onSsidChange(sel){";
+    html += "  var c=document.getElementById('custom_ssid_box');";
+    html += "  var pwGroup=document.getElementById('pw_field_group');";
+    html += "  var pw=document.getElementById('wifiPw');";
+    html += "  var pwHint=document.getElementById('pw_hint');";
+    html += "  var isCustom=(sel.value==='__custom__');";
+    html += "  c.style.display=isCustom?'block':'none';";
+    html += "  if(isCustom){";
+    html += "    pwGroup.style.display='block';";
+    html += "    pw.placeholder='Enter Wi-Fi password (leave empty if open)';";
+    html += "    pwHint.style.display='none';";
+    html += "    return;";
+    html += "  }";
+    html += "  var opt=sel.options[sel.selectedIndex];";
+    html += "  var isOpen=(opt&&opt.getAttribute('data-open')==='1');";
+    html += "  var isSaved=(opt&&opt.getAttribute('data-saved')==='1');";
+    html += "  if(isOpen){";
+    html += "    pwGroup.style.display='none';";
+    html += "    pw.value='';";
+    html += "    pwHint.style.display='none';";
+    html += "  }else{";
+    html += "    pwGroup.style.display='block';";
+    html += "    if(isSaved){";
+    html += "      pw.value='';";
+    html += "      pw.placeholder='Leave blank to use saved password';";
+    html += "      pwHint.innerText='Previously saved network. Leave blank to keep existing password.';";
+    html += "      pwHint.style.display='block';";
+    html += "    }else{";
+    html += "      pw.value='';";
+    html += "      pw.placeholder='Enter Wi-Fi password';";
+    html += "      pwHint.style.display='none';";
+    html += "    }";
+    html += "  }";
+    html += "}";
+    html += "function validateSaveForm(){";
+    html += "  var sel=document.querySelector(\"select[name='ssid']\");";
+    html += "  var isCustom=(sel.value==='__custom__');";
+    html += "  var pw=document.getElementById('wifiPw');";
+    html += "  if(isCustom){";
+    html += "    var cSsid=document.getElementById('customSsid').value.trim();";
+    html += "    if(!cSsid){";
+    html += "      showAlert('Network Required','Please enter a network SSID.');";
+    html += "      return false;";
+    html += "    }";
+    html += "  }else{";
+    html += "    var opt=sel.options[sel.selectedIndex];";
+    html += "    var isOpen=(opt&&opt.getAttribute('data-open')==='1');";
+    html += "    var isSaved=(opt&&opt.getAttribute('data-saved')==='1');";
+    html += "    if(!isOpen&&!isSaved){";
+    html += "      if(!pw.value||pw.value.trim()===''){";
+    html += "        showAlert('Password Required','Password is required for this secured network.');";
+    html += "        return false;";
+    html += "      }";
+    html += "    }";
+    html += "  }";
+    html += "  return true;";
+    html += "}";
     html += "var targetForm=null;";
-    html += "function openModal(formId,title,desc){targetForm=document.getElementById(formId);document.getElementById('mTitle').innerText=title;document.getElementById('mDesc').innerText=desc;document.getElementById('modal').style.display='flex';}";
+    html += "function showAlert(title,desc){";
+    html += "  document.getElementById('mTitle').innerText=title;";
+    html += "  document.getElementById('mDesc').innerText=desc;";
+    html += "  document.getElementById('mActions').innerHTML=\"<button type='button' class='btn btn-primary' style='width:100%' onclick='closeModal()'>OK</button>\";";
+    html += "  document.getElementById('modal').style.display='flex';";
+    html += "}";
+    html += "function openModal(formId,title,desc){";
+    html += "  targetForm=document.getElementById(formId);";
+    html += "  document.getElementById('mTitle').innerText=title;";
+    html += "  document.getElementById('mDesc').innerText=desc;";
+    html += "  document.getElementById('mActions').innerHTML=\"<button type='button' class='btn-modal-cancel' onclick='closeModal()'>Cancel</button><button type='button' class='btn-modal-confirm' onclick='confirmAction()'>Confirm</button>\";";
+    html += "  document.getElementById('modal').style.display='flex';";
+    html += "}";
     html += "function closeModal(){document.getElementById('modal').style.display='none';targetForm=null;}";
     html += "function confirmAction(){if(targetForm) targetForm.submit(); closeModal();}";
     html += "function togglePw(id,btn){var el=document.getElementById(id);el.type=(el.type==='password')?'text':'password';btn.style.opacity=(el.type==='text')?'1':'0.45';}";
+    html += "window.addEventListener('DOMContentLoaded',function(){var s=document.querySelector(\"select[name='ssid']\");if(s)onSsidChange(s);});";
     html += "</script>";
     html += "</head><body>";
     html += "<div class='container'>";
@@ -403,7 +473,7 @@ void handlePortalRoot() {
     }
 
     // Save Form
-    html += "<form id='saveForm' action='/save' method='POST'>";
+    html += "<form id='saveForm' action='/save' method='POST' onsubmit='return validateSaveForm()'>";
 
     // Wi-Fi Dropdown
     html += "<div class='field-group'><label>Wi-Fi Network</label>";
@@ -414,8 +484,11 @@ void handlePortalRoot() {
         for (int i = 0; i < n; ++i) {
             String netName = WiFi.SSID(i);
             int rssi = WiFi.RSSI(i);
+            bool isOpen = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+            bool isSaved = (netName == config_ssid);
             String isCurrent = (netName == config_ssid) ? " selected" : "";
-            html += "<option value='" + netName + "'" + isCurrent + ">" + netName + " (" + String(rssi) + " dBm)</option>";
+            html += "<option value='" + netName + "' data-open='" + (isOpen ? "1" : "0") + "' data-saved='" + (isSaved ? "1" : "0") + "'" + isCurrent + ">";
+            html += (isOpen ? "&#128275; " : "&#128274; ") + netName + " (" + (isOpen ? "Open" : String(rssi) + " dBm") + (isSaved ? " - Saved" : "") + ")</option>";
         }
         html += "<option value='__custom__'>Other network (Enter manually)...</option>";
     }
@@ -424,15 +497,17 @@ void handlePortalRoot() {
     // Custom SSID Box
     html += "<div id='custom_ssid_box' class='field-group' style='display:" + String(n == 0 ? "block" : "none") + ";'>";
     html += "<label>Network Name (SSID)</label>";
-    html += "<input type='text' name='custom_ssid' placeholder='Enter network SSID'>";
+    html += "<input type='text' id='customSsid' name='custom_ssid' placeholder='Enter network SSID'>";
     html += "</div>";
 
-    // Password with eye toggle
-    html += "<div class='field-group'><label>Password</label>";
+    // Password with eye toggle (hidden if open, shown if locked)
+    html += "<div id='pw_field_group' class='field-group'><label>Password</label>";
     html += "<div class='pw-wrap'>";
-    html += "<input type='password' id='wifiPw' name='password' placeholder='Enter password (leave empty if open)'>";
+    html += "<input type='password' id='wifiPw' name='password' placeholder='Enter password'>";
     html += "<button type='button' class='eye-btn' onclick=\"togglePw('wifiPw',this)\" aria-label='Show/hide password'>&#128065;</button>";
-    html += "</div></div>";
+    html += "</div>";
+    html += "<div id='pw_hint' class='helper' style='display:none;'></div>";
+    html += "</div>";
 
     // Server Domain
     html += "<div class='field-group'><label>Server Domain / Tunnel Host</label>";
@@ -462,9 +537,9 @@ void handlePortalRoot() {
     html += "<div id='modal' class='modal-overlay'><div class='modal'>";
     html += "<h3 id='mTitle'>Confirm Action</h3>";
     html += "<p id='mDesc'>Are you sure you want to proceed?</p>";
-    html += "<div class='modal-actions'>";
-    html += "<button class='btn-modal-cancel' onclick='closeModal()'>Cancel</button>";
-    html += "<button class='btn-modal-confirm' onclick='confirmAction()'>Confirm</button>";
+    html += "<div class='modal-actions' id='mActions'>";
+    html += "<button type='button' class='btn-modal-cancel' onclick='closeModal()'>Cancel</button>";
+    html += "<button type='button' class='btn-modal-confirm' onclick='confirmAction()'>Confirm</button>";
     html += "</div></div></div>";
 
     html += "</body></html>";
@@ -477,14 +552,21 @@ void handlePortalSave() {
     if (selected_ssid == "__custom__") {
         selected_ssid = portalServer.arg("custom_ssid");
     }
+    selected_ssid.trim();
     String new_pass  = portalServer.arg("password");
     String new_host  = portalServer.arg("host");
     String new_token = portalServer.arg("token");
+    new_host.trim();
     new_token.trim();
 
     // If user left the token field blank, keep the currently stored token unchanged
     if (new_token.length() == 0) {
         new_token = config_auth_token;
+    }
+
+    // If reconnecting to previously saved network with empty password, use previous password
+    if (selected_ssid == config_ssid && new_pass.length() == 0) {
+        new_pass = config_password;
     }
 
     saveConfiguration(selected_ssid, new_pass, new_host, new_token);
@@ -769,6 +851,10 @@ void loop() {
             }
         }
         if (new_ssid.length() > 0) {
+            // If reconnecting to previously saved network with empty password, use previous password
+            if (new_ssid == config_ssid && new_pass.length() == 0) {
+                new_pass = config_password;
+            }
             Serial.printf("[Remote] Saving new Wi-Fi '%s' and restarting...\n", new_ssid.c_str());
             saveConfiguration(new_ssid, new_pass, config_server_host, config_auth_token);
             #if USE_WEBSOCKET
@@ -794,7 +880,9 @@ void loop() {
             if (i > 0) jsonResp += ",";
             String ssid = WiFi.SSID(i);
             ssid.replace("\"", "\\\"");
-            jsonResp += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+            bool isOpen = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+            bool isSaved = (WiFi.SSID(i) == config_ssid);
+            jsonResp += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(WiFi.RSSI(i)) + ",\"open\":" + (isOpen ? "true" : "false") + ",\"saved\":" + (isSaved ? "true" : "false") + "}";
         }
         jsonResp += "]";
         #if USE_WEBSOCKET

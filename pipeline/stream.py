@@ -27,6 +27,7 @@ class Stream:
         # ESP WebSocket management & Dashboard subscribers
         self.esp_ws = None
         self.esp_ws_loop = None
+        self.esp_current_ssid = None
         self.dash_clients = set()
         self.pending_scan_future = None
 
@@ -160,6 +161,13 @@ class Stream:
                                 print(f"[Stream Receiver] Error parsing scan results from ESP: {parse_err}")
                                 if self.pending_scan_future and not self.pending_scan_future.done():
                                     self.pending_scan_future.set_result([])
+                        elif txt.startswith("DEVICE_INFO:"):
+                            try:
+                                info = json.loads(txt[len("DEVICE_INFO:"):])
+                                self.esp_current_ssid = info.get("ssid", "")
+                                print(f"[Stream Receiver] ESP device info: SSID='{self.esp_current_ssid}'")
+                            except Exception as parse_err:
+                                print(f"[Stream Receiver] Error parsing DEVICE_INFO: {parse_err}")
                         else:
                             print(f"[Stream Receiver] Received text message from ESP: {txt}")
             except WebSocketDisconnect:
@@ -170,6 +178,7 @@ class Stream:
                 if self.esp_ws is websocket:
                     self.esp_ws = None
                     self.esp_ws_loop = None
+                    self.esp_current_ssid = None
                     if self.pending_scan_future and not self.pending_scan_future.done():
                         self.pending_scan_future.set_result([])
                     await broadcast_esp_status(False)
@@ -425,14 +434,15 @@ class Stream:
         # -------------------------------------------------------------
         @app.get("/esp", response_class=HTMLResponse)
         def esp_control_panel():
-            html = """<!DOCTYPE html>
+            current_ssid = self.esp_current_ssid or ""
+            html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>GuideBot ESP Control Panel</title>
   <style>
-    :root {
+    :root {{
       --bg: #090a0f;
       --surface: #13151c;
       --border: #222634;
@@ -444,89 +454,90 @@ class Stream:
       --danger-hover: #dc2626;
       --success: #10b981;
       --warning: #f59e0b;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }
-    body { background: var(--bg); color: var(--text); padding: 28px 16px; display: flex; justify-content: center; -webkit-font-smoothing: antialiased; }
-    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 28px; width: 100%; max-width: 460px; box-shadow: 0 16px 40px rgba(0,0,0,0.5); }
-    .header { text-align: center; margin-bottom: 24px; }
-    h1 { font-size: 20px; font-weight: 700; color: #fff; margin-bottom: 4px; }
-    p.sub { font-size: 13px; color: var(--text-muted); }
-    
-    .status-badge {
+    }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }}
+    body {{ background: var(--bg); color: var(--text); padding: 28px 16px; display: flex; justify-content: center; -webkit-font-smoothing: antialiased; }}
+    .card {{ background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 28px; width: 100%; max-width: 460px; box-shadow: 0 16px 40px rgba(0,0,0,0.5); }}
+    .header {{ text-align: center; margin-bottom: 24px; }}
+    h1 {{ font-size: 20px; font-weight: 700; color: #fff; margin-bottom: 4px; }}
+    p.sub {{ font-size: 13px; color: var(--text-muted); }}
+
+    .status-badge {{
       display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px;
       border-radius: 999px; font-size: 13px; font-weight: 600; margin-top: 12px;
       transition: all 0.3s ease;
-    }
-    .status-badge.online { background: rgba(16, 185, 129, 0.15); border: 1px solid #059669; color: #a7f3d0; }
-    .status-badge.offline { background: rgba(239, 68, 68, 0.15); border: 1px solid #dc2626; color: #fca5a5; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; }
-    .status-badge.online .dot { background: #10b981; box-shadow: 0 0 8px #10b981; }
-    .status-badge.offline .dot { background: #ef4444; }
+    }}
+    .status-badge.online {{ background: rgba(16, 185, 129, 0.15); border: 1px solid #059669; color: #a7f3d0; }}
+    .status-badge.offline {{ background: rgba(239, 68, 68, 0.15); border: 1px solid #dc2626; color: #fca5a5; }}
+    .dot {{ width: 8px; height: 8px; border-radius: 50%; }}
+    .status-badge.online .dot {{ background: #10b981; box-shadow: 0 0 8px #10b981; }}
+    .status-badge.offline .dot {{ background: #ef4444; }}
 
-    .offline-banner {
+    .offline-banner {{
       background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.25);
       border-radius: 12px; padding: 12px; font-size: 12px; color: #fca5a5;
       text-align: center; margin-bottom: 20px; display: none; line-height: 1.5;
-    }
+    }}
 
-    .section-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-muted); margin-bottom: 12px; }
-    .field-group { margin-bottom: 16px; }
-    label { font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.6px; display: block; margin-bottom: 7px; }
-    select, input {
+    .section-title {{ font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-muted); margin-bottom: 12px; }}
+    .field-group {{ margin-bottom: 16px; }}
+    label {{ font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.6px; display: block; margin-bottom: 7px; }}
+    select, input {{
       width: 100%; padding: 11px 14px; background: #1a1d27; border: 1px solid var(--border);
       border-radius: 10px; color: #fff; font-size: 14px; outline: none; transition: border-color 0.15s;
-    }
-    select:focus, input:focus { border-color: var(--primary); }
-    
-    .pw-wrap { position: relative; display: flex; }
-    .pw-wrap input { flex: 1; padding-right: 42px; }
-    .eye-btn {
+    }}
+    select:focus, input:focus {{ border-color: var(--primary); }}
+
+    .pw-wrap {{ position: relative; display: flex; }}
+    .pw-wrap input {{ flex: 1; padding-right: 42px; }}
+    .eye-btn {{
       position: absolute; right: 0; top: 0; height: 100%; width: 40px; background: none;
       border: none; cursor: pointer; font-size: 16px; color: var(--text-muted); opacity: 0.45;
       display: flex; align-items: center; justify-content: center; transition: opacity 0.15s;
-    }
-    .eye-btn:hover { opacity: 0.8; }
+    }}
+    .eye-btn:hover {{ opacity: 0.8; }}
 
-    .scan-row { display: flex; gap: 8px; margin-bottom: 10px; }
-    .btn-scan {
+    .scan-row {{ display: flex; gap: 8px; margin-bottom: 10px; }}
+    .btn-scan {{
       padding: 10px 14px; border-radius: 10px; background: #222634; border: 1px solid var(--border);
       color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap;
       transition: all 0.15s;
-    }
-    .btn-scan:hover:not(:disabled) { border-color: var(--primary); color: #fff; }
+    }}
+    .btn-scan:hover:not(:disabled) {{ border-color: var(--primary); color: #fff; }}
 
-    .btn {
+    .btn {{
       width: 100%; padding: 12px 16px; border-radius: 10px; font-size: 14px; font-weight: 600;
       cursor: pointer; border: none; transition: all 0.15s; display: flex; align-items: center; justify-content: center; gap: 8px;
-    }
-    .btn-primary { background: var(--primary); color: #fff; }
-    .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
-    .btn-warning { background: transparent; border: 1px solid #78350f; color: #fde68a; margin-top: 12px; }
-    .btn-warning:hover:not(:disabled) { background: rgba(245, 158, 11, 0.1); border-color: var(--warning); color: #fff; }
-    .btn-danger { background: transparent; border: 1px solid #7f1d1d; color: #fca5a5; margin-top: 12px; }
-    .btn-danger:hover:not(:disabled) { background: rgba(239, 68, 68, 0.12); border-color: var(--danger); color: #fff; }
-    
-    .btn:disabled, .btn-scan:disabled, select:disabled, input:disabled {
+    }}
+    .btn-primary {{ background: var(--primary); color: #fff; }}
+    .btn-primary:hover:not(:disabled) {{ background: var(--primary-hover); }}
+    .btn-warning {{ background: transparent; border: 1px solid #78350f; color: #fde68a; margin-top: 12px; }}
+    .btn-warning:hover:not(:disabled) {{ background: rgba(245, 158, 11, 0.1); border-color: var(--warning); color: #fff; }}
+    .btn-danger {{ background: transparent; border: 1px solid #7f1d1d; color: #fca5a5; margin-top: 12px; }}
+    .btn-danger:hover:not(:disabled) {{ background: rgba(239, 68, 68, 0.12); border-color: var(--danger); color: #fff; }}
+
+    .btn:disabled, .btn-scan:disabled, select:disabled, input:disabled {{
       opacity: 0.4; cursor: not-allowed; pointer-events: none;
-    }
+    }}
+    .helper {{ font-size: 12px; color: var(--text-muted); margin-top: 6px; line-height: 1.4; }}
 
-    .divider { height: 1px; background: var(--border); margin: 24px 0; }
-    .feedback { margin-top: 16px; padding: 12px; border-radius: 10px; font-size: 13px; display: none; line-height: 1.4; }
+    .divider {{ height: 1px; background: var(--border); margin: 24px 0; }}
+    .feedback {{ margin-top: 16px; padding: 12px; border-radius: 10px; font-size: 13px; display: none; line-height: 1.4; }}
 
-    .modal-overlay {
+    .modal-overlay {{
       position: fixed; inset: 0; background: rgba(0,0,0,0.75); backdrop-filter: blur(4px);
       display: none; align-items: center; justify-content: center; padding: 16px; z-index: 99;
-    }
-    .modal {
+    }}
+    .modal {{
       background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
       padding: 24px; max-width: 380px; width: 100%; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.6);
-    }
-    .modal h3 { font-size: 17px; font-weight: 700; color: #fff; margin-bottom: 8px; }
-    .modal p { font-size: 13px; color: var(--text-muted); line-height: 1.5; margin-bottom: 20px; }
-    .modal-actions { display: flex; gap: 10px; }
-    .modal-actions button { flex: 1; padding: 11px; font-size: 13px; font-weight: 600; border-radius: 9px; border: none; cursor: pointer; }
-    .btn-modal-cancel { background: #222634; color: var(--text); }
-    .btn-modal-confirm { background: var(--danger); color: #fff; }
+    }}
+    .modal h3 {{ font-size: 17px; font-weight: 700; color: #fff; margin-bottom: 8px; }}
+    .modal p {{ font-size: 13px; color: var(--text-muted); line-height: 1.5; margin-bottom: 20px; }}
+    .modal-actions {{ display: flex; gap: 10px; }}
+    .modal-actions button {{ flex: 1; padding: 11px; font-size: 13px; font-weight: 600; border-radius: 9px; border: none; cursor: pointer; }}
+    .btn-modal-cancel {{ background: #222634; color: var(--text); }}
+    .btn-modal-confirm {{ background: var(--danger); color: #fff; }}
   </style>
 </head>
 <body>
@@ -561,12 +572,13 @@ class Stream:
       <input type="text" id="ssidInput" placeholder="e.g. MyHomeNetwork">
     </div>
 
-    <div class="field-group">
+    <div id="passGroup" class="field-group">
       <label>Password</label>
       <div class="pw-wrap">
-        <input type="password" id="passInput" placeholder="Enter password (leave empty if open)">
+        <input type="password" id="passInput" placeholder="Enter password">
         <button type="button" class="eye-btn" onclick="togglePw('passInput', this)" aria-label="Show/hide password">&#128065;</button>
       </div>
+      <div id="passHint" class="helper" style="display:none;"></div>
     </div>
 
     <button id="switchBtn" class="btn btn-primary" onclick="submitWifiChange()">Save & Switch Wi-Fi</button>
@@ -597,52 +609,53 @@ class Stream:
     let isConnected = false;
     let pendingAction = null;
     let ws = null;
+    const ESP_CURRENT_SSID = {json.dumps(current_ssid)};
 
-    function initWebSocket() {
+    function initWebSocket() {{
       const loc = window.location;
       const wsProto = loc.protocol === "https:" ? "wss:" : "ws:";
       const wsUrl = wsProto + "//" + loc.host + "/ws/esp-status";
       ws = new WebSocket(wsUrl);
 
-      ws.onopen = () => { console.log("[WS] Connected to status stream"); };
-      ws.onmessage = (event) => {
-        try {
+      ws.onopen = () => {{ console.log("[WS] Connected to status stream"); }};
+      ws.onmessage = (event) => {{
+        try {{
           const data = JSON.parse(event.data);
-          if (data.type === "esp_status") {
+          if (data.type === "esp_status") {{
             updateStatusUI(data.connected);
-          }
-        } catch (e) { }
-      };
-      ws.onclose = () => {
+          }}
+        }} catch (e) {{ }}
+      }};
+      ws.onclose = () => {{
         setTimeout(initWebSocket, 2000);
-      };
-    }
+      }};
+    }}
 
-    async function checkStatusDirect() {
-      try {
+    async function checkStatusDirect() {{
+      try {{
         const res = await fetch("/esp/status");
         const data = await res.json();
         updateStatusUI(data.connected);
-      } catch (err) {
+      }} catch (err) {{
         updateStatusUI(false);
-      }
-    }
+      }}
+    }}
 
-    function updateStatusUI(connected) {
+    function updateStatusUI(connected) {{
       isConnected = connected;
       const badge = document.getElementById('statusBadge');
       const text = document.getElementById('statusText');
       const notice = document.getElementById('offlineNotice');
 
-      if (connected) {
+      if (connected) {{
         badge.className = 'status-badge online';
         text.innerText = 'ESP Connected';
         notice.style.display = 'none';
-      } else {
+      }} else {{
         badge.className = 'status-badge offline';
         text.innerText = 'ESP Disconnected';
         notice.style.display = 'block';
-      }
+      }}
 
       // Toggle form & action buttons
       document.getElementById('scanBtn').disabled = !connected;
@@ -652,9 +665,9 @@ class Stream:
       document.getElementById('switchBtn').disabled = !connected;
       document.getElementById('rebootBtn').disabled = !connected;
       document.getElementById('eraseBtn').disabled = !connected;
-    }
+    }}
 
-    async function scanNetworks() {
+    async function scanNetworks() {{
       if (!isConnected) return;
       const scanBtn = document.getElementById('scanBtn');
       const select = document.getElementById('networkSelect');
@@ -662,132 +675,171 @@ class Stream:
       scanBtn.innerText = "Scanning...";
       showFeedback("Scanning nearby Wi-Fi networks via ESP32...");
 
-      try {
-        const res = await fetch("/esp/scan", { method: "POST" });
+      try {{
+        const res = await fetch("/esp/scan", {{ method: "POST" }});
         const data = await res.json();
-        if (data.status === "ok") {
+        if (data.status === "ok") {{
           select.innerHTML = '<option value="">-- Select a Scanned Network --</option>';
-          if (data.networks && data.networks.length > 0) {
-            data.networks.forEach(net => {
+          if (data.networks && data.networks.length > 0) {{
+            data.networks.forEach(net => {{
               const opt = document.createElement('option');
               opt.value = net.ssid;
-              opt.innerText = `${net.ssid} (${net.rssi} dBm)`;
+              const icon = net.open ? '🔓 ' : '🔒 ';
+              const sec = net.open ? 'Open' : `${{net.rssi}} dBm`;
+              const savedTag = net.saved ? ' · Saved' : '';
+              opt.innerText = `${{icon}}${{net.ssid}} (${{sec}}${{savedTag}})`;
+              opt.dataset.open = net.open ? '1' : '0';
+              opt.dataset.saved = net.saved ? '1' : '0';
               select.appendChild(opt);
-            });
-            showFeedback(`Found ${data.networks.length} networks nearby.`);
-          } else {
+            }});
+            showFeedback(`Found ${{data.networks.length}} networks nearby.`);
+          }} else {{
             select.innerHTML = '<option value="">No networks detected (type manually)</option>';
             showFeedback("No networks detected nearby.", true);
-          }
-        } else {
+          }}
+        }} else {{
           showFeedback(data.detail || "Scan request failed.", true);
-        }
-      } catch (err) {
+        }}
+      }} catch (err) {{
         showFeedback("Error requesting scan: " + err.message, true);
-      } finally {
+      }} finally {{
         scanBtn.disabled = false;
         scanBtn.innerText = "🔍 Scan Wi-Fi";
-      }
-    }
+      }}
+    }}
 
-    function onSelectNetwork(sel) {
-      if (sel.value) {
-        document.getElementById('ssidInput').value = sel.value;
-      }
-    }
+    function onSelectNetwork(sel) {{
+      if (!sel.value) return;
+      document.getElementById('ssidInput').value = sel.value;
+      const opt = sel.options[sel.selectedIndex];
+      const isOpen = (opt && opt.dataset.open === '1');
+      const isSaved = (opt && opt.dataset.saved === '1') || sel.value === ESP_CURRENT_SSID;
+      const passGroup = document.getElementById('passGroup');
+      const passInp = document.getElementById('passInput');
+      const passHint = document.getElementById('passHint');
 
-    function togglePw(id, btn) {
+      if (isOpen) {{
+        passGroup.style.display = 'none';
+        passInp.value = '';
+        passHint.style.display = 'none';
+      }} else {{
+        passGroup.style.display = 'block';
+        passInp.value = '';
+        if (isSaved) {{
+          passInp.placeholder = 'Leave blank to keep saved password';
+          passHint.innerText = 'Previously saved network — leave blank to reuse stored password.';
+          passHint.style.display = 'block';
+        }} else {{
+          passInp.placeholder = 'Enter password';
+          passHint.style.display = 'none';
+        }}
+      }}
+    }}
+
+    function togglePw(id, btn) {{
       const el = document.getElementById(id);
       el.type = (el.type === 'password') ? 'text' : 'password';
       btn.style.opacity = (el.type === 'text') ? '1' : '0.45';
-    }
+    }}
 
-    async function submitWifiChange() {
+    async function submitWifiChange() {{
       if (!isConnected) return;
       const ssid = document.getElementById('ssidInput').value.trim();
       const password = document.getElementById('passInput').value;
 
-      if (!ssid) {
+      if (!ssid) {{
         showFeedback("Please specify an SSID network name.", true);
         return;
-      }
+      }}
+
+      // Determine if open or saved network
+      const select = document.getElementById('networkSelect');
+      const opt = select.options[select.selectedIndex];
+      const isOpen = (opt && opt.dataset && opt.dataset.open === '1');
+      const isSaved = (opt && opt.dataset && opt.dataset.saved === '1') || ssid === ESP_CURRENT_SSID;
+
+      // Block: locked network + not previously saved + no password
+      if (!isOpen && !isSaved && !password.trim()) {{
+        showFeedback("Password is required for this secured network.", true);
+        return;
+      }}
 
       showFeedback("Sending new Wi-Fi credentials to ESP32...");
-      try {
-        const res = await fetch("/esp/wifi", {
+      try {{
+        const res = await fetch("/esp/wifi", {{
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ssid, password })
-        });
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ ssid, password }})
+        }});
         const data = await res.json();
-        if (data.status === "ok") {
-          showFeedback(`Saved! ESP32 is switching to '${ssid}' and reconnecting.`);
-        } else {
+        if (data.status === "ok") {{
+          showFeedback(`Saved! ESP32 is switching to '${{ssid}}' and reconnecting.`);
+        }} else {{
           showFeedback(data.detail || "Failed to update Wi-Fi.", true);
-        }
-      } catch (err) {
+        }}
+      }} catch (err) {{
         showFeedback("Failed to send command: " + err.message, true);
-      }
-    }
+      }}
+    }}
 
-    function openModal(action, title, desc) {
+    function openModal(action, title, desc) {{
       if (!isConnected) return;
       pendingAction = action;
       document.getElementById('mTitle').innerText = title;
       document.getElementById('mDesc').innerText = desc;
       const confirmBtn = document.getElementById('mConfirmBtn');
-      if (action === 'erase') {
+      if (action === 'erase') {{
         confirmBtn.className = 'btn-modal-confirm';
         confirmBtn.innerText = 'Erase & Reboot';
-      } else {
+      }} else {{
         confirmBtn.className = 'btn-modal-confirm';
         confirmBtn.style.background = '#d97706';
         confirmBtn.innerText = 'Restart';
-      }
+      }}
       document.getElementById('modal').style.display = 'flex';
-    }
+    }}
 
-    function closeModal() {
+    function closeModal() {{
       document.getElementById('modal').style.display = 'none';
       pendingAction = null;
-    }
+    }}
 
-    async function executeModalAction() {
+    async function executeModalAction() {{
       const action = pendingAction;
       closeModal();
       if (!action || !isConnected) return;
 
-      if (action === 'reboot') {
+      if (action === 'reboot') {{
         showFeedback("Sending soft reboot command to ESP32...");
-        try {
-          const res = await fetch("/esp/reboot", { method: "POST" });
+        try {{
+          const res = await fetch("/esp/reboot", {{ method: "POST" }});
           const data = await res.json();
           if (data.status === "ok") showFeedback("Reboot command sent! ESP32 is restarting.");
           else showFeedback(data.detail || "Command failed.", true);
-        } catch (err) {
+        }} catch (err) {{
           showFeedback("Error: " + err.message, true);
-        }
-      } else if (action === 'erase') {
+        }}
+      }} else if (action === 'erase') {{
         showFeedback("Sending wipe command to ESP32...");
-        try {
-          const res = await fetch("/esp/erase", { method: "POST" });
+        try {{
+          const res = await fetch("/esp/erase", {{ method: "POST" }});
           const data = await res.json();
           if (data.status === "ok") showFeedback("Wipe command sent! ESP32 is wiping credentials and launching GuideBot-Setup.");
           else showFeedback(data.detail || "Command failed.", true);
-        } catch (err) {
+        }} catch (err) {{
           showFeedback("Error: " + err.message, true);
-        }
-      }
-    }
+        }}
+      }}
+    }}
 
-    function showFeedback(msg, isErr = false) {
+    function showFeedback(msg, isErr = false) {{
       const fb = document.getElementById('feedback');
       fb.style.display = 'block';
       fb.innerText = msg;
       fb.style.background = isErr ? '#451a1a' : '#132b1a';
       fb.style.border = isErr ? '1px solid #ef4444' : '1px solid #059669';
       fb.style.color = isErr ? '#fca5a5' : '#a7f3d0';
-    }
+    }}
 
     // Startup
     checkStatusDirect();

@@ -15,8 +15,8 @@ An AI-powered wearable navigation assistant for people who are blind or losing t
 - **Depth Estimation:** Distance estimation classified into Close / Medium / Far (MiDaS).
 - **Audio & Spoken Alerts:** Spoken hazard warnings with directional cues (pyttsx3).
 - **Voice Commands:** Spoken queries for navigation guidance (OpenAI Whisper) via host microphone or browser Web Audio interface (`/audio`).
-- **Remote ESP Management Dashboard (`/esp`):** Scan & switch Wi-Fi networks, reboot, and wipe credentials into hotspot mode remotely over the tunnel without physical access.
-- **Captive Portal Wi-Fi Provisioning:** Setup hotspot (`GuideBot-Setup` at `192.168.4.1` / `http://guidebot.local`) for credential configuration with hidden tokens and eye visibility toggles.
+- **Remote ESP Management Dashboard (`/esp`):** Scan & switch Wi-Fi networks, reboot, and wipe credentials into hotspot mode remotely over the tunnel without physical access. Smart password handling: open networks hide the password field; previously saved networks allow blank password to reuse stored credentials; new secured networks require a password before connecting.
+- **Captive Portal Wi-Fi Provisioning:** Setup hotspot (`GuideBot-Setup` at `192.168.4.1` / `http://guidebot.local`) for credential configuration with hidden tokens and eye visibility toggles. Same smart password logic as the remote dashboard applies here too.
 - **Text Reading (OCR):** Reads signs and text on demand (EasyOCR).
 - **Face Recognition:** Identifies known individuals (InsightFace).
 
