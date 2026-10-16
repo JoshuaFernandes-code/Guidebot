@@ -18,7 +18,9 @@ An AI-powered wearable navigation assistant for people who are blind or losing t
 - **Remote ESP Management Dashboard (`/esp`):** Scan & switch Wi-Fi networks, reboot, and wipe credentials into hotspot mode remotely over the tunnel without physical access. Smart password handling: open networks hide the password field; previously saved networks allow blank password to reuse stored credentials; new secured networks require a password before connecting.
 - **Captive Portal Wi-Fi Provisioning:** Setup hotspot (`GuideBot-Setup` at `192.168.4.1` / `http://guidebot.local`) for credential configuration with hidden tokens and eye visibility toggles. Same smart password logic as the remote dashboard applies here too.
 - **Text Reading (OCR):** Reads signs and text on demand (EasyOCR).
-- **Face Recognition:** Identifies known individuals (InsightFace).
+- **Face Recognition:** Identifies known individuals (InsightFace) with multi-image person support and real-time hot-reloading.
+- **Known Faces Dashboard (`/faces`):** Add & manage known faces from any browser. Supports live webcam photo snapshots and file uploads with drag-and-drop, SQLite-backed name mapping, automatic duplicate file naming (`name_1.png`, `name_2.png`), thumbnail viewing, and instant hot-reloading without restarting the inference server.
+- **Unified Navigation Hub (`/`):** Quick-launch cards linking to ESP Remote Control (`/esp`), Known Faces Management (`/faces`), and Voice Input (`/audio`).
 
 ---
 

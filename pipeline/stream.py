@@ -3,21 +3,25 @@ import threading
 import time
 import json
 import asyncio
+import os
+import base64
 import numpy as np
 from config import CONFIG
+from pipeline import faces_db
 
 try:
     import uvicorn
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, HTTPException, status
-    from fastapi.responses import HTMLResponse
+    from fastapi.responses import HTMLResponse, JSONResponse
 except ImportError:
     uvicorn = None
     FastAPI = None
 
 class Stream:
-    def __init__(self, voice_input=None):
+    def __init__(self, voice_input=None, face_recognizer=None):
         self.mode = CONFIG.get("stream_mode", "push_receiver")
         self.voice_input = voice_input
+        self.face_recognizer = face_recognizer  # FaceRecognizer ref for hot-reload after face add/delete
         self.latest_frame = None
         self.latest_timestamp = 0
         self.frame_count = 0
@@ -83,6 +87,60 @@ class Stream:
         self.app = app
 
         @app.get("/")
+        def home(request: Request):
+            accept = request.headers.get("accept", "")
+            # If request is from browser requesting HTML, render portal page
+            if "text/html" in accept:
+                pass  # Fall through to HTML rendering below
+            else:
+                return health()
+
+            use_web_mic = CONFIG.get("use_web_mic", False)
+            audio_link = '<a href="/audio" class="nav-card">🎤<span>Voice Input</span></a>' if use_web_mic else \
+                         '<div class="nav-card disabled">🎤<span>Voice Input</span><small>USE_WEB_MIC=false</small></div>'
+            html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GuideBot</title>
+  <style>
+    :root {{
+      --bg: #090a0f; --surface: #13151c; --border: #222634;
+      --text: #f1f5f9; --muted: #94a3b8; --primary: #3b82f6;
+    }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }}
+    body {{ background: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; }}
+    h1 {{ font-size: 28px; font-weight: 800; margin-bottom: 6px; }}
+    p.sub {{ color: var(--muted); font-size: 14px; margin-bottom: 40px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; width: 100%; max-width: 640px; }}
+    .nav-card {{
+      background: var(--surface); border: 1px solid var(--border); border-radius: 18px;
+      padding: 28px 20px; display: flex; flex-direction: column; align-items: center; gap: 12px;
+      text-decoration: none; color: var(--text); font-size: 15px; font-weight: 600;
+      transition: all 0.15s; cursor: pointer;
+    }}
+    .nav-card:hover {{ border-color: var(--primary); background: #181c2a; }}
+    .nav-card.disabled {{ opacity: 0.4; cursor: not-allowed; pointer-events: none; }}
+    .nav-card > :first-child {{ font-size: 36px; }}
+    small {{ font-size: 11px; color: var(--muted); font-weight: 400; }}
+    .status-dot {{ width: 8px; height: 8px; border-radius: 50%; background: #10b981; display: inline-block; margin-right: 6px; }}
+    footer {{ margin-top: 40px; font-size: 12px; color: var(--muted); }}
+  </style>
+</head>
+<body>
+  <h1>🦯 GuideBot</h1>
+  <p class="sub">AI-powered navigation assistant — server is <span class="status-dot"></span>online</p>
+  <div class="grid">
+    <a href="/esp" class="nav-card">📡<span>ESP Control</span><small>Wi-Fi &amp; device</small></a>
+    <a href="/faces" class="nav-card">🧑‍🤝‍🧑<span>Known Faces</span><small>Add &amp; manage</small></a>
+    {audio_link}
+  </div>
+  <footer>GuideBot Stream Receiver &mdash; port {self.port}</footer>
+</body>
+</html>"""
+            return HTMLResponse(content=html)
+
         @app.get("/health")
         def health():
             with self.lock:
@@ -95,6 +153,7 @@ class Stream:
                 "has_active_frame": has_frame,
                 "seconds_since_last_frame": last_seen,
             }
+
 
         @app.post("/frame")
         async def receive_frame(request: Request):
@@ -190,7 +249,6 @@ class Stream:
         # -------------------------------------------------------------
         if CONFIG.get("use_web_mic", False):
             import tempfile
-            import os
 
             @app.get("/audio", response_class=HTMLResponse)
             def audio_control_panel():
@@ -946,6 +1004,545 @@ class Stream:
                 self.esp_ws = None
                 await broadcast_esp_status(False)
                 raise HTTPException(status_code=500, detail=f"Failed to deliver command to ESP32: {e}")
+
+        # -------------------------------------------------------------
+        # KNOWN FACES MANAGEMENT DASHBOARD (/faces)
+        # -------------------------------------------------------------
+        @app.get("/faces", response_class=HTMLResponse)
+        def faces_panel():
+            html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GuideBot — Known Faces</title>
+  <style>
+    :root {
+      --bg: #090a0f; --surface: #13151c; --border: #222634;
+      --text: #f1f5f9; --muted: #94a3b8; --primary: #3b82f6;
+      --primary-hover: #2563eb; --success: #10b981; --danger: #ef4444;
+      --danger-hover: #dc2626; --warning: #f59e0b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }
+    body { background: var(--bg); color: var(--text); padding: 24px 16px; display: flex; justify-content: center; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 28px; width: 100%; max-width: 520px; box-shadow: 0 16px 40px rgba(0,0,0,0.5); }
+    .header { text-align: center; margin-bottom: 28px; }
+    h1 { font-size: 21px; font-weight: 800; margin-bottom: 4px; }
+    .sub { font-size: 13px; color: var(--muted); }
+    .back-link { display: inline-block; margin-bottom: 18px; font-size: 13px; color: var(--primary); text-decoration: none; }
+    .back-link:hover { text-decoration: underline; }
+
+    .section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); margin-bottom: 14px; }
+    .field-group { margin-bottom: 16px; }
+    label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: var(--muted); }
+    input[type=text] {
+      width: 100%; padding: 11px 14px; background: #1a1d27; border: 1px solid var(--border);
+      border-radius: 10px; color: #fff; font-size: 14px; outline: none;
+    }
+    input[type=text]:focus { border-color: var(--primary); }
+
+    /* Tabs */
+    .tabs { display: flex; gap: 0; margin-bottom: 20px; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+    .tab-btn {
+      flex: 1; padding: 10px; background: transparent; border: none; color: var(--muted);
+      font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.15s;
+    }
+    .tab-btn.active { background: #1e2232; color: #fff; }
+    .tab-btn:hover:not(.active) { background: #161a25; }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+
+    /* Webcam */
+    #videoWrap { position: relative; border-radius: 12px; overflow: hidden; background: #000; margin-bottom: 12px; aspect-ratio: 4/3; }
+    #videoEl { width: 100%; height: 100%; object-fit: cover; display: block; }
+    #snapCanvas { display: none; }
+    #previewImg { width: 100%; border-radius: 12px; margin-bottom: 12px; display: none; }
+
+    /* File drop */
+    .drop-zone {
+      border: 2px dashed var(--border); border-radius: 12px; padding: 32px 20px;
+      text-align: center; cursor: pointer; transition: all 0.15s; margin-bottom: 12px;
+    }
+    .drop-zone:hover, .drop-zone.dragover { border-color: var(--primary); background: #111828; }
+    .drop-zone .icon { font-size: 32px; margin-bottom: 8px; }
+    .drop-zone p { font-size: 13px; color: var(--muted); }
+    #fileInput { display: none; }
+    #filePreview { width: 100%; border-radius: 12px; margin-bottom: 12px; display: none; }
+
+    /* Buttons */
+    .btn {
+      width: 100%; padding: 12px 16px; border-radius: 10px; font-size: 14px; font-weight: 600;
+      cursor: pointer; border: none; transition: all 0.15s; display: flex; align-items: center; justify-content: center; gap: 8px;
+    }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
+    .btn-secondary { background: #222634; border: 1px solid var(--border); color: var(--text); }
+    .btn-secondary:hover:not(:disabled) { border-color: var(--primary); color: #fff; }
+    .btn-danger-sm {
+      padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 600;
+      background: transparent; border: 1px solid #7f1d1d; color: #fca5a5; cursor: pointer; transition: all 0.15s;
+    }
+    .btn-danger-sm:hover { background: rgba(239,68,68,0.12); border-color: var(--danger); color: #fff; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .divider { height: 1px; background: var(--border); margin: 24px 0; }
+    .helper { font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+    /* Faces list */
+    .faces-list { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+    .face-row {
+      display: flex; align-items: center; gap: 14px; background: #1a1d27;
+      border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px;
+    }
+    .face-thumb { width: 52px; height: 52px; border-radius: 8px; object-fit: cover; flex-shrink: 0; background: #222634; }
+    .face-info { flex: 1; min-width: 0; }
+    .face-name { font-size: 14px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .face-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .empty-state { text-align: center; color: var(--muted); font-size: 13px; padding: 24px 0; }
+
+    /* Feedback */
+    .feedback {
+      margin-top: 16px; padding: 12px 14px; border-radius: 10px; font-size: 13px;
+      display: none; line-height: 1.4;
+    }
+    .feedback.success { background: #0d2218; border: 1px solid #059669; color: #a7f3d0; }
+    .feedback.error   { background: #1f0e0e; border: 1px solid var(--danger); color: #fca5a5; }
+
+    /* Modal */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.75); backdrop-filter: blur(4px);
+      display: none; align-items: center; justify-content: center; padding: 16px; z-index: 99;
+    }
+    .modal {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
+      padding: 24px; max-width: 340px; width: 100%; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.6);
+    }
+    .modal h3 { font-size: 17px; font-weight: 700; margin-bottom: 8px; }
+    .modal p  { font-size: 13px; color: var(--muted); margin-bottom: 20px; }
+    .modal-actions { display: flex; gap: 10px; }
+    .modal-actions button { flex: 1; padding: 11px; font-size: 13px; font-weight: 600; border-radius: 9px; border: none; cursor: pointer; }
+    .btn-modal-cancel  { background: #222634; color: var(--text); }
+    .btn-modal-confirm { background: var(--danger); color: #fff; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <a href="/" class="back-link">← Back to Dashboard</a>
+    <div class="header">
+      <h1>🧑‍🤝‍🧑 Known Faces</h1>
+      <p class="sub">Add &amp; manage faces for recognition</p>
+    </div>
+
+    <!-- Add Face Section -->
+    <div class="section-title">Add New Face</div>
+
+    <div class="field-group">
+      <label>Person's Name</label>
+      <input type="text" id="nameInput" placeholder="e.g. Nathan Pereira" maxlength="80">
+      <div class="helper">Used as the display label during recognition. Spaces allowed.</div>
+    </div>
+
+    <!-- Source Tabs -->
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('webcam', this)">📷 Webcam</button>
+      <button class="tab-btn"       onclick="switchTab('file', this)">📁 Upload File</button>
+    </div>
+
+    <!-- Webcam pane -->
+    <div id="tab-webcam" class="tab-pane active">
+      <div id="videoWrap">
+        <video id="videoEl" autoplay playsinline muted></video>
+      </div>
+      <canvas id="snapCanvas"></canvas>
+      <img id="previewImg" alt="Captured photo">
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <button class="btn btn-secondary" id="camBtn" onclick="startCamera()" style="flex:1;">Start Camera</button>
+        <button class="btn btn-secondary" id="snapBtn" onclick="snapPhoto()" style="flex:1;" disabled>📸 Capture</button>
+        <button class="btn btn-secondary" id="retakeBtn" onclick="retakePhoto()" style="flex:1;display:none;">↺ Retake</button>
+      </div>
+      <button class="btn btn-primary" id="submitWebcamBtn" onclick="submitFace('webcam')" disabled>Save Face</button>
+    </div>
+
+    <!-- File upload pane -->
+    <div id="tab-file" class="tab-pane">
+      <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()"
+           ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDrop(event)">
+        <div class="icon">🖼️</div>
+        <p>Click to choose an image or drag &amp; drop here</p>
+        <p style="margin-top:6px;font-size:11px;">JPG, PNG, WebP accepted</p>
+      </div>
+      <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.webp" onchange="onFileChosen(event)">
+      <img id="filePreview" alt="Preview">
+      <button class="btn btn-primary" id="submitFileBtn" onclick="submitFace('file')" disabled>Save Face</button>
+    </div>
+
+    <div id="feedback" class="feedback"></div>
+
+    <div class="divider"></div>
+
+    <!-- Faces List -->
+    <div class="section-title">Registered Faces <span id="faceCount" style="color:var(--text);font-size:12px;"></span></div>
+    <div id="facesList" class="faces-list">
+      <div class="empty-state">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Delete Confirm Modal -->
+  <div id="modal" class="modal-overlay">
+    <div class="modal">
+      <h3 id="mTitle">Delete Face?</h3>
+      <p id="mDesc">This will remove the image and registration permanently.</p>
+      <div class="modal-actions">
+        <button class="btn-modal-cancel"  onclick="closeModal()">Cancel</button>
+        <button class="btn-modal-confirm" id="mConfirm" onclick="confirmDelete()">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ── State ──────────────────────────────────────────────────────────
+    let stream       = null;   // MediaStream
+    let capturedBlob = null;   // Blob from webcam snapshot
+    let fileBlob     = null;   // Blob from file picker
+    let pendingDeleteId = null;
+
+    // ── Tab switching ──────────────────────────────────────────────────
+    function switchTab(name, btn) {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById('tab-' + name).classList.add('active');
+      stopCamera();
+      clearCapture();
+    }
+
+    // ── Webcam ─────────────────────────────────────────────────────────
+    async function startCamera() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+        const vid = document.getElementById('videoEl');
+        vid.srcObject = stream;
+        document.getElementById('camBtn').disabled  = true;
+        document.getElementById('snapBtn').disabled = false;
+        document.getElementById('previewImg').style.display = 'none';
+        document.getElementById('videoWrap').style.display  = 'block';
+      } catch (e) {
+        showFeedback('Camera access denied: ' + e.message, true);
+      }
+    }
+
+    function stopCamera() {
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      const vid = document.getElementById('videoEl');
+      vid.srcObject = null;
+      document.getElementById('camBtn').disabled  = false;
+      document.getElementById('snapBtn').disabled = true;
+    }
+
+    function snapPhoto() {
+      const vid = document.getElementById('videoEl');
+      const canvas = document.getElementById('snapCanvas');
+      canvas.width  = vid.videoWidth  || 640;
+      canvas.height = vid.videoHeight || 480;
+      canvas.getContext('2d').drawImage(vid, 0, 0);
+      canvas.toBlob(blob => {
+        capturedBlob = blob;
+        const url = URL.createObjectURL(blob);
+        const preview = document.getElementById('previewImg');
+        preview.src = url;
+        preview.style.display = 'block';
+        document.getElementById('videoWrap').style.display  = 'none';
+        document.getElementById('snapBtn').style.display    = 'none';
+        document.getElementById('retakeBtn').style.display  = 'flex';
+        document.getElementById('submitWebcamBtn').disabled = false;
+        stopCamera();
+      }, 'image/png');
+    }
+
+    function retakePhoto() {
+      clearCapture();
+      document.getElementById('videoWrap').style.display  = 'block';
+      document.getElementById('snapBtn').style.display    = 'flex';
+      document.getElementById('retakeBtn').style.display  = 'none';
+      document.getElementById('submitWebcamBtn').disabled = true;
+      startCamera();
+    }
+
+    function clearCapture() {
+      capturedBlob = null;
+      fileBlob     = null;
+      document.getElementById('previewImg').style.display  = 'none';
+      document.getElementById('filePreview').style.display = 'none';
+      document.getElementById('submitWebcamBtn').disabled  = true;
+      document.getElementById('submitFileBtn').disabled    = true;
+    }
+
+    // ── File upload ────────────────────────────────────────────────────
+    function onFileChosen(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      loadFileBlob(file);
+    }
+
+    function handleDragOver(e)  { e.preventDefault(); document.getElementById('dropZone').classList.add('dragover'); }
+    function handleDragLeave(e) { document.getElementById('dropZone').classList.remove('dragover'); }
+    function handleDrop(e) {
+      e.preventDefault();
+      document.getElementById('dropZone').classList.remove('dragover');
+      const file = e.dataTransfer.files[0];
+      if (file) loadFileBlob(file);
+    }
+
+    function loadFileBlob(file) {
+      fileBlob = file;
+      const url = URL.createObjectURL(file);
+      const preview = document.getElementById('filePreview');
+      preview.src = url;
+      preview.style.display = 'block';
+      document.getElementById('submitFileBtn').disabled = false;
+    }
+
+    // ── Submit ─────────────────────────────────────────────────────────
+    async function submitFace(source) {
+      const name = document.getElementById('nameInput').value.trim();
+      if (!name) { showFeedback('Please enter a name first.', true); return; }
+
+      const blob = source === 'webcam' ? capturedBlob : fileBlob;
+      if (!blob) { showFeedback('No image selected.', true); return; }
+
+      const ext  = blob.type === 'image/png' ? '.png'
+                 : blob.type === 'image/webp' ? '.webp' : '.jpg';
+      const btn  = source === 'webcam'
+                   ? document.getElementById('submitWebcamBtn')
+                   : document.getElementById('submitFileBtn');
+
+      btn.disabled    = true;
+      btn.textContent = 'Saving…';
+
+      try {
+        const reader = new FileReader();
+        const base64Data = await new Promise((resolve, reject) => {
+          reader.onload = () => resolve(reader.result.split(',')[1]);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+
+        const res = await fetch('/faces/add', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            display_name: name,
+            image_b64: base64Data,
+            ext: ext
+          })
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+          showFeedback('✅ ' + name + ' saved as ' + data.filename, false);
+          document.getElementById('nameInput').value = '';
+          clearCapture();
+          stopCamera();
+          document.getElementById('snapBtn').style.display   = 'flex';
+          document.getElementById('retakeBtn').style.display = 'none';
+          document.getElementById('videoWrap').style.display = 'block';
+          loadFacesList();
+        } else {
+          showFeedback('Error: ' + (data.detail || 'Upload failed'), true);
+        }
+      } catch (e) {
+        showFeedback('Network error: ' + e.message, true);
+      } finally {
+        btn.disabled    = false;
+        btn.textContent = 'Save Face';
+      }
+    }
+
+    // ── Faces list ─────────────────────────────────────────────────────
+    async function loadFacesList() {
+      const list = document.getElementById('facesList');
+      try {
+        const res  = await fetch('/faces/list');
+        const data = await res.json();
+        const faces = data.faces || [];
+        document.getElementById('faceCount').textContent = faces.length ? '(' + faces.length + ')' : '';
+
+        if (!faces.length) {
+          list.innerHTML = '<div class="empty-state">No faces registered yet.</div>';
+          return;
+        }
+
+        list.innerHTML = faces.map(f => `
+          <div class="face-row" id="row-${f.id}">
+            <img class="face-thumb" src="/faces/thumb/${encodeURIComponent(f.filename)}"
+                 onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 52 52%22><rect fill=%22%23222634%22 width=%2252%22 height=%2252%22/><text x=%2226%22 y=%2234%22 text-anchor=%22middle%22 font-size=%2226%22>👤</text></svg>'"
+                 alt="${f.display_name}">
+            <div class="face-info">
+              <div class="face-name">${escHtml(f.display_name)}</div>
+              <div class="face-meta">${escHtml(f.filename)} &middot; ${formatDate(f.added_at)}</div>
+            </div>
+            <button class="btn-danger-sm" onclick="askDelete(${f.id}, '${escHtml(f.display_name)}')">Delete</button>
+          </div>`).join('');
+      } catch (e) {
+        list.innerHTML = '<div class="empty-state" style="color:#fca5a5;">Failed to load faces.</div>';
+      }
+    }
+
+    // ── Delete ─────────────────────────────────────────────────────────
+    function askDelete(id, name) {
+      pendingDeleteId = id;
+      document.getElementById('mTitle').textContent = 'Delete "' + name + '"?';
+      document.getElementById('mDesc').textContent  = 'This will permanently remove the image and its registration.';
+      document.getElementById('modal').style.display = 'flex';
+    }
+
+    function closeModal() {
+      document.getElementById('modal').style.display = 'none';
+      pendingDeleteId = null;
+    }
+
+    async function confirmDelete() {
+      if (!pendingDeleteId) return;
+      closeModal();
+      try {
+        const res  = await fetch('/faces/' + pendingDeleteId, { method: 'DELETE' });
+        const data = await res.json();
+        if (res.ok) {
+          showFeedback('Face removed successfully.', false);
+          loadFacesList();
+        } else {
+          showFeedback('Error: ' + (data.detail || 'Delete failed'), true);
+        }
+      } catch (e) {
+        showFeedback('Network error: ' + e.message, true);
+      }
+    }
+
+    // ── Utilities ──────────────────────────────────────────────────────
+    function showFeedback(msg, isErr) {
+      const fb = document.getElementById('feedback');
+      fb.textContent  = msg;
+      fb.className    = 'feedback ' + (isErr ? 'error' : 'success');
+      fb.style.display = 'block';
+      setTimeout(() => { fb.style.display = 'none'; }, 5000);
+    }
+
+    function escHtml(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    function formatDate(iso) {
+      try { return new Date(iso).toLocaleString(undefined, { dateStyle:'medium', timeStyle:'short' }); }
+      catch { return iso; }
+    }
+
+    // Close modal on overlay click
+    document.getElementById('modal').addEventListener('click', e => {
+      if (e.target === document.getElementById('modal')) closeModal();
+    });
+
+    // Init
+    loadFacesList();
+  </script>
+</body>
+</html>"""
+            return HTMLResponse(content=html)
+
+        @app.get("/faces/list")
+        def faces_list():
+            return JSONResponse({"faces": faces_db.list_faces()})
+
+        @app.get("/faces/thumb/{filename}")
+        def faces_thumb(filename: str):
+            """Serve a face image by filename (basename only, no path traversal)."""
+            import re as _re
+            # Sanitise: only allow safe basenames
+            if not _re.match(r'^[\w\-. ]+$', filename) or '..' in filename:
+                raise HTTPException(status_code=400, detail="Invalid filename")
+            path = os.path.join(faces_db.KNOWN_FACES_DIR, filename)
+            if not os.path.exists(path):
+                raise HTTPException(status_code=404, detail="Image not found")
+            ext = os.path.splitext(filename)[1].lower()
+            mime = {"jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}.get(ext, "image/jpeg")
+            with open(path, "rb") as fh:
+                data = fh.read()
+            return Response(content=data, media_type=mime)
+
+        @app.post("/faces/add")
+        async def faces_add(request: Request):
+            content_type = request.headers.get("content-type", "")
+            name = ""
+            raw_bytes = b""
+            ext = ".png"
+
+            if "application/json" in content_type:
+                try:
+                    body = await request.json()
+                except Exception:
+                    raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+                name = (body.get("display_name") or "").strip()
+                b64_str = body.get("image_b64") or ""
+                ext = (body.get("ext") or ".png").strip().lower()
+
+                if not b64_str:
+                    raise HTTPException(status_code=400, detail="image file is required")
+
+                try:
+                    raw_bytes = base64.b64decode(b64_str)
+                except Exception:
+                    raise HTTPException(status_code=400, detail="Invalid base64 image data")
+            else:
+                # Fallback: attempt form parsing if multipart is present
+                try:
+                    form = await request.form()
+                    name = (form.get("display_name") or "").strip()
+                    upload = form.get("image")
+                    if upload is not None:
+                        raw_bytes = await upload.read()
+                        orig = getattr(upload, "filename", "") or ""
+                        ext = os.path.splitext(orig)[1].lower() or ".png"
+                except Exception as form_err:
+                    raise HTTPException(status_code=400, detail=f"Failed to parse form: {form_err}")
+
+            if not name:
+                raise HTTPException(status_code=400, detail="display_name is required")
+            if not raw_bytes:
+                raise HTTPException(status_code=400, detail="image file is required")
+
+            if not ext.startswith("."):
+                ext = "." + ext
+
+            try:
+                result = faces_db.add_face(name, raw_bytes, ext)
+            except ValueError as ve:
+                raise HTTPException(status_code=400, detail=str(ve))
+
+            # Hot-reload FaceRecognizer if available
+            if self.face_recognizer is not None:
+                try:
+                    self.face_recognizer.reload()
+                except Exception as reload_err:
+                    print(f"[Faces] Warning: hot-reload failed: {reload_err}")
+
+            print(f"[Faces] Added '{name}' → {result['filename']}")
+            return JSONResponse(result, status_code=201)
+
+        @app.delete("/faces/{face_id}")
+        async def faces_delete(face_id: int):
+            deleted = faces_db.delete_face(face_id, delete_file=True)
+            if not deleted:
+                raise HTTPException(status_code=404, detail="Face not found")
+
+            # Hot-reload FaceRecognizer if available
+            if self.face_recognizer is not None:
+                try:
+                    self.face_recognizer.reload()
+                except Exception as reload_err:
+                    print(f"[Faces] Warning: hot-reload failed: {reload_err}")
+
+            print(f"[Faces] Deleted face id={face_id}")
+            return {"status": "ok", "deleted_id": face_id}
 
         server_config = uvicorn.Config(
             app=app,

@@ -148,13 +148,14 @@ def draw_standby_screen(w: int, h: int, stream: Stream):
 def main():
     print("[GuideBot] Starting - Phase 6C (Face Recognition)")
     voice_input     = VoiceInput()
-    stream          = Stream(voice_input=voice_input)
     detector        = Detector()
     depth_estimator = DepthEstimator()
     decision_engine = DecisionEngine()
     tts             = TTS()
     ocr_reader      = OCRReader()
     face_recognizer = FaceRecognizer()
+    # Pass face_recognizer so /faces API can hot-reload embeddings after add/delete
+    stream          = Stream(voice_input=voice_input, face_recognizer=face_recognizer)
 
     inference = InferencePipeline(stream, detector, depth_estimator, decision_engine)
 
