@@ -8,3 +8,4 @@ data/currency_model/
 .env
 secrets.h
 esp32/**/secrets.h
+context.md

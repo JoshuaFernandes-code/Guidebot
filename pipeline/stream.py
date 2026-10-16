@@ -11,7 +11,7 @@ from pipeline import faces_db
 
 try:
     import uvicorn
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, HTTPException, status
+    from fastapi import BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect, Request, Response, HTTPException, status
     from fastapi.responses import HTMLResponse, JSONResponse
 except ImportError:
     uvicorn = None
@@ -22,6 +22,7 @@ class Stream:
         self.mode = CONFIG.get("stream_mode", "push_receiver")
         self.voice_input = voice_input
         self.face_recognizer = face_recognizer  # FaceRecognizer ref for hot-reload after face add/delete
+        self._face_reload_lock = threading.Lock()
         self.latest_frame = None
         self.latest_timestamp = 0
         self.frame_count = 0
@@ -57,6 +58,16 @@ class Stream:
         if not self.auth_token:
             return True
         return provided_token == self.auth_token
+
+    def _reload_faces(self):
+        """Refresh face embeddings without holding up a dashboard request."""
+        if self.face_recognizer is None:
+            return
+        with self._face_reload_lock:
+            try:
+                self.face_recognizer.reload()
+            except Exception as reload_err:
+                print(f"[Faces] Warning: hot-reload failed: {reload_err}")
 
     def _process_frame_bytes(self, raw_bytes: bytes) -> bool:
         if not raw_bytes or len(raw_bytes) == 0:
@@ -1339,7 +1350,7 @@ class Stream:
         const data = await res.json();
 
         if (res.ok) {
-          showFeedback('✅ ' + name + ' saved as ' + data.filename, false);
+          showFeedback('✅ ' + name + ' saved as ' + data.filename + '. Recognition is updating.', false);
           document.getElementById('nameInput').value = '';
           clearCapture();
           stopCamera();
@@ -1403,9 +1414,10 @@ class Stream:
 
     async function confirmDelete() {
       if (!pendingDeleteId) return;
+      const faceId = pendingDeleteId;
       closeModal();
       try {
-        const res  = await fetch('/faces/' + pendingDeleteId, { method: 'DELETE' });
+        const res  = await fetch('/faces/' + faceId, { method: 'DELETE' });
         const data = await res.json();
         if (res.ok) {
           showFeedback('Face removed successfully.', false);
@@ -1469,7 +1481,7 @@ class Stream:
             return Response(content=data, media_type=mime)
 
         @app.post("/faces/add")
-        async def faces_add(request: Request):
+        async def faces_add(request: Request, background_tasks: BackgroundTasks):
             content_type = request.headers.get("content-type", "")
             name = ""
             raw_bytes = b""
@@ -1518,28 +1530,18 @@ class Stream:
             except ValueError as ve:
                 raise HTTPException(status_code=400, detail=str(ve))
 
-            # Hot-reload FaceRecognizer if available
-            if self.face_recognizer is not None:
-                try:
-                    self.face_recognizer.reload()
-                except Exception as reload_err:
-                    print(f"[Faces] Warning: hot-reload failed: {reload_err}")
+            background_tasks.add_task(self._reload_faces)
 
             print(f"[Faces] Added '{name}' → {result['filename']}")
             return JSONResponse(result, status_code=201)
 
         @app.delete("/faces/{face_id}")
-        async def faces_delete(face_id: int):
+        async def faces_delete(face_id: int, background_tasks: BackgroundTasks):
             deleted = faces_db.delete_face(face_id, delete_file=True)
             if not deleted:
                 raise HTTPException(status_code=404, detail="Face not found")
 
-            # Hot-reload FaceRecognizer if available
-            if self.face_recognizer is not None:
-                try:
-                    self.face_recognizer.reload()
-                except Exception as reload_err:
-                    print(f"[Faces] Warning: hot-reload failed: {reload_err}")
+            background_tasks.add_task(self._reload_faces)
 
             print(f"[Faces] Deleted face id={face_id}")
             return {"status": "ok", "deleted_id": face_id}
