@@ -274,12 +274,16 @@ def main():
             cv2.putText(annotated_frame, f"| Inference: {inf_fps_text} fps",
                         (220, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            cv2.imshow("GuideBot", annotated_frame)
+            if annotated_frame is not None and getattr(annotated_frame, "size", 0) > 0 and len(annotated_frame.shape) == 3 and annotated_frame.shape[0] > 0 and annotated_frame.shape[1] > 0:
+                cv2.imshow("GuideBot", annotated_frame)
 
             key = cv2.waitKey(1)
             if (key & 0xFF == ord('q')) or is_window_closed("GuideBot"):
                 break
 
+        except cv2.error as e:
+            print(f"[GuideBot] OpenCV display error (recovered): {e}")
+            continue
         except Exception as e:
             print(f"[GuideBot] Frame error (recovered): {e}")
             continue

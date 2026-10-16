@@ -51,6 +51,7 @@ String config_password;
 String config_server_host;
 int    config_server_port = 443;
 String config_auth_token;
+int    config_wifi_auth_mode = -1;
 
 bool   config_is_configured = false;
 
@@ -64,6 +65,113 @@ volatile bool flag_reboot          = false;
 volatile bool flag_scan_wifi       = false;
 volatile bool flag_set_wifi        = false;
 String        pending_wifi_payload = "";
+
+const unsigned long WIFI_ROAM_SCAN_INTERVAL_MS = 30000;
+const unsigned long WIFI_ROAM_COOLDOWN_MS = 120000;
+const int WIFI_ROAM_RSSI_MARGIN_DB = 10;
+unsigned long last_roam_scan_ms = 0;
+unsigned long last_roam_ms = 0;
+bool roaming_scan_active = false;
+bool roaming_in_progress = false;
+
+struct AccessPoint {
+    bool valid = false;
+    int32_t rssi = -127;
+    int32_t channel = 0;
+    uint8_t auth_mode = WIFI_AUTH_OPEN;
+    uint8_t bssid[6] = {0};
+};
+
+AccessPoint pending_roam_ap;
+
+bool sameBssid(const uint8_t *left, const uint8_t *right) {
+    return memcmp(left, right, 6) == 0;
+}
+
+bool isSameScanGroup(int left, int right) {
+    return WiFi.SSID(left) == WiFi.SSID(right) &&
+           WiFi.encryptionType(left) == WiFi.encryptionType(right);
+}
+
+int strongestScanIndexForGroup(int index, int count) {
+    int strongest = index;
+    for (int i = 0; i < count; ++i) {
+        if (isSameScanGroup(index, i) && WiFi.RSSI(i) > WiFi.RSSI(strongest)) {
+            strongest = i;
+        }
+    }
+    return strongest;
+}
+
+bool readAccessPoint(int index, AccessPoint &ap) {
+    String ssid;
+    uint8_t *bssid = nullptr;
+    uint8_t encryption = WIFI_AUTH_OPEN;
+    int32_t rssi = -127;
+    int32_t channel = 0;
+    if (!WiFi.getNetworkInfo(index, ssid, encryption, rssi, bssid, channel) || bssid == nullptr) {
+        return false;
+    }
+    ap.valid = true;
+    ap.rssi = rssi;
+    ap.channel = channel;
+    ap.auth_mode = encryption;
+    memcpy(ap.bssid, bssid, sizeof(ap.bssid));
+    return true;
+}
+
+bool findBestAccessPoint(const String &ssid, int auth_mode, int count, AccessPoint &best) {
+    best.valid = false;
+    for (int i = 0; i < count; ++i) {
+        if (WiFi.SSID(i) != ssid || (auth_mode >= 0 && WiFi.encryptionType(i) != auth_mode)) {
+            continue;
+        }
+        AccessPoint candidate;
+        if (readAccessPoint(i, candidate) && (!best.valid || candidate.rssi > best.rssi)) {
+            best = candidate;
+        }
+    }
+    return best.valid;
+}
+
+void beginAccessPointConnection(const String &ssid, const String &password, const AccessPoint &ap) {
+    WiFi.disconnect(false, false);
+    WiFi.begin(ssid.c_str(), password.c_str(), ap.channel, ap.bssid);
+}
+
+bool beginBestAccessPointConnection(const String &ssid, const String &password, int auth_mode) {
+    int count = WiFi.scanNetworks();
+    AccessPoint best;
+    bool found = count > 0 && findBestAccessPoint(ssid, auth_mode, count, best);
+    WiFi.scanDelete();
+    if (!found) {
+        WiFi.begin(ssid.c_str(), password.c_str());
+        return false;
+    }
+    beginAccessPointConnection(ssid, password, best);
+    return true;
+}
+
+String groupedScanResultsJson(int count) {
+    String json = "[";
+    bool first = true;
+    for (int i = 0; i < count; ++i) {
+        if (strongestScanIndexForGroup(i, count) != i) {
+            continue;
+        }
+        String ssid = WiFi.SSID(i);
+        ssid.replace("\"", "\\\"");
+        bool isOpen = WiFi.encryptionType(i) == WIFI_AUTH_OPEN;
+        if (!first) json += ",";
+        first = false;
+        json += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(WiFi.RSSI(i)) +
+                ",\"channel\":" + String(WiFi.channel(i)) +
+                ",\"auth\":" + String(WiFi.encryptionType(i)) +
+                ",\"open\":" + (isOpen ? "true" : "false") +
+                ",\"saved\":" + (WiFi.SSID(i) == config_ssid ? "true" : "false") + "}";
+    }
+    return json + "]";
+}
 
 void sanitizeConfig() {
     config_ssid.trim();
@@ -105,6 +213,7 @@ void loadConfiguration() {
         config_server_host = prefs.getString("host", DEFAULT_SERVER_HOST);
         config_server_port = prefs.getInt("port", DEFAULT_SERVER_PORT);
         config_auth_token  = prefs.getString("token", DEFAULT_AUTH_TOKEN);
+        config_wifi_auth_mode = prefs.getInt("wifi_auth", -1);
     } else {
         // Unconfigured or reset: clear runtime Wi-Fi so board does not attempt auto-join
         config_ssid        = "";
@@ -112,6 +221,7 @@ void loadConfiguration() {
         config_server_host = prefs.getString("host", DEFAULT_SERVER_HOST);
         config_server_port = prefs.getInt("port", DEFAULT_SERVER_PORT);
         config_auth_token  = prefs.getString("token", DEFAULT_AUTH_TOKEN);
+        config_wifi_auth_mode = -1;
     }
     prefs.end();
 
@@ -124,12 +234,13 @@ void loadConfiguration() {
     Serial.printf("         Auth Token:  %s\n", config_auth_token.length() > 0 ? "***" : "none");
 }
 
-void saveConfiguration(const String& new_ssid, const String& new_pass, const String& new_host, const String& new_token) {
+void saveConfiguration(const String& new_ssid, const String& new_pass, const String& new_host, const String& new_token, int new_auth_mode = -1) {
     config_ssid          = new_ssid;
     config_password      = new_pass;
     config_server_host   = new_host;
     config_server_port   = 443;
     config_auth_token    = new_token;
+    config_wifi_auth_mode = new_auth_mode;
     config_is_configured = (new_ssid.length() > 0);
     sanitizeConfig();
 
@@ -140,6 +251,7 @@ void saveConfiguration(const String& new_ssid, const String& new_pass, const Str
     prefs.putString("host", config_server_host);
     prefs.putInt("port", config_server_port);
     prefs.putString("token", config_auth_token);
+    prefs.putInt("wifi_auth", config_wifi_auth_mode);
     prefs.end();
     Serial.println("[Config] Successfully saved new credentials to flash.");
 }
@@ -159,6 +271,7 @@ void performClearCredentials() {
     config_is_configured = false;
     config_ssid          = "";
     config_password      = "";
+    config_wifi_auth_mode = -1;
     Serial.println("[Config] Stored Wi-Fi erased & hardware cache wiped successfully.");
 }
 
@@ -384,15 +497,18 @@ void handlePortalRoot() {
     html += "  var pwGroup=document.getElementById('pw_field_group');";
     html += "  var pw=document.getElementById('wifiPw');";
     html += "  var pwHint=document.getElementById('pw_hint');";
+    html += "  var auth=document.getElementById('wifiAuth');";
     html += "  var isCustom=(sel.value==='__custom__');";
     html += "  c.style.display=isCustom?'block':'none';";
     html += "  if(isCustom){";
+    html += "    auth.value='-1';";
     html += "    pwGroup.style.display='block';";
     html += "    pw.placeholder='Enter Wi-Fi password (leave empty if open)';";
     html += "    pwHint.style.display='none';";
     html += "    return;";
     html += "  }";
     html += "  var opt=sel.options[sel.selectedIndex];";
+    html += "  auth.value=(opt&&opt.getAttribute('data-auth'))||'-1';";
     html += "  var isOpen=(opt&&opt.getAttribute('data-open')==='1');";
     html += "  var isSaved=(opt&&opt.getAttribute('data-saved')==='1');";
     html += "  if(isOpen){";
@@ -477,17 +593,21 @@ void handlePortalRoot() {
 
     // Wi-Fi Dropdown
     html += "<div class='field-group'><label>Wi-Fi Network</label>";
+    html += "<input type='hidden' id='wifiAuth' name='auth' value='-1'>";
     html += "<select name='ssid' onchange='onSsidChange(this)'>";
     if (n == 0) {
         html += "<option value='__custom__'>No networks found (Enter manually)</option>";
     } else {
         for (int i = 0; i < n; ++i) {
+            if (strongestScanIndexForGroup(i, n) != i) {
+                continue;
+            }
             String netName = WiFi.SSID(i);
             int rssi = WiFi.RSSI(i);
             bool isOpen = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
-            bool isSaved = (netName == config_ssid);
-            String isCurrent = (netName == config_ssid) ? " selected" : "";
-            html += "<option value='" + netName + "' data-open='" + (isOpen ? "1" : "0") + "' data-saved='" + (isSaved ? "1" : "0") + "'" + isCurrent + ">";
+            bool isSaved = netName == config_ssid && (config_wifi_auth_mode < 0 || WiFi.encryptionType(i) == config_wifi_auth_mode);
+            String isCurrent = isSaved ? " selected" : "";
+            html += "<option value='" + netName + "' data-open='" + (isOpen ? "1" : "0") + "' data-saved='" + (isSaved ? "1" : "0") + "' data-auth='" + String(WiFi.encryptionType(i)) + "'" + isCurrent + ">";
             html += (isOpen ? "&#128275; " : "&#128274; ") + netName + " (" + (isOpen ? "Open" : String(rssi) + " dBm") + (isSaved ? " - Saved" : "") + ")</option>";
         }
         html += "<option value='__custom__'>Other network (Enter manually)...</option>";
@@ -556,6 +676,7 @@ void handlePortalSave() {
     String new_pass  = portalServer.arg("password");
     String new_host  = portalServer.arg("host");
     String new_token = portalServer.arg("token");
+    int new_auth_mode = portalServer.arg("auth").toInt();
     new_host.trim();
     new_token.trim();
 
@@ -569,7 +690,7 @@ void handlePortalSave() {
         new_pass = config_password;
     }
 
-    saveConfiguration(selected_ssid, new_pass, new_host, new_token);
+    saveConfiguration(selected_ssid, new_pass, new_host, new_token, new_auth_mode);
 
     String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
     html += "<style>body{background:#121214;color:#ffeb3b;font-family:sans-serif;text-align:center;padding:50px 20px;}h2{color:#fff;}</style>";
@@ -723,6 +844,53 @@ bool initCamera() {
 unsigned long last_frame_time = 0;
 unsigned long wifi_disconnect_start = 0;
 
+void checkWifiRoaming(unsigned long now) {
+    if (config_wifi_auth_mode < 0 || !config_is_configured || config_ssid.length() == 0) {
+        return;
+    }
+
+    if (!roaming_scan_active) {
+        if (now - last_roam_scan_ms < WIFI_ROAM_SCAN_INTERVAL_MS ||
+            (last_roam_ms != 0 && now - last_roam_ms < WIFI_ROAM_COOLDOWN_MS)) {
+            return;
+        }
+        WiFi.scanNetworks(true);
+        roaming_scan_active = true;
+        last_roam_scan_ms = now;
+        return;
+    }
+
+    int count = WiFi.scanComplete();
+    if (count == WIFI_SCAN_RUNNING) {
+        return;
+    }
+    roaming_scan_active = false;
+    if (count < 0) {
+        WiFi.scanDelete();
+        return;
+    }
+
+    AccessPoint best;
+    bool found = findBestAccessPoint(config_ssid, config_wifi_auth_mode, count, best);
+    WiFi.scanDelete();
+    if (!found || sameBssid(best.bssid, WiFi.BSSID()) ||
+        best.rssi < WiFi.RSSI() + WIFI_ROAM_RSSI_MARGIN_DB) {
+        pending_roam_ap.valid = false;
+        return;
+    }
+
+    if (!pending_roam_ap.valid || !sameBssid(pending_roam_ap.bssid, best.bssid)) {
+        pending_roam_ap = best;
+        return;
+    }
+
+    Serial.printf("[WiFi] Roaming to a stronger AP (%d dBm -> %d dBm)\n", WiFi.RSSI(), best.rssi);
+    beginAccessPointConnection(config_ssid, config_password, best);
+    roaming_in_progress = true;
+    last_roam_ms = now;
+    pending_roam_ap.valid = false;
+}
+
 void setup() {
     Serial.begin(115200);
     delay(1000);
@@ -752,7 +920,11 @@ void setup() {
     if (config_is_configured && config_ssid.length() > 0) {
         Serial.printf("[WiFi] Attempting to connect to '%s'", config_ssid.c_str());
         WiFi.mode(WIFI_STA);
-        WiFi.begin(config_ssid.c_str(), config_password.c_str());
+        if (beginBestAccessPointConnection(config_ssid, config_password, config_wifi_auth_mode)) {
+            Serial.println(" using the strongest compatible access point.");
+        } else {
+            Serial.println(" using SSID-only fallback.");
+        }
 
         unsigned long start_attempt = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - start_attempt < 10000) {
@@ -796,6 +968,7 @@ void setup() {
 
     adaptive_window_ms   = millis();
     adaptive_frame_count = 0;
+    last_roam_scan_ms = millis();
 }
 
 void loop() {
@@ -834,6 +1007,7 @@ void loop() {
         Serial.println("\n[Remote] Executing SET_WIFI command...");
         String new_ssid = "";
         String new_pass = "";
+        int new_auth_mode = -1;
         int ssidKeyIdx = pending_wifi_payload.indexOf("\"ssid\":");
         if (ssidKeyIdx != -1) {
             int startQuote = pending_wifi_payload.indexOf('\"', ssidKeyIdx + 7);
@@ -850,13 +1024,22 @@ void loop() {
                 new_pass = pending_wifi_payload.substring(startQuote + 1, endQuote);
             }
         }
+        int authKeyIdx = pending_wifi_payload.indexOf("\"auth\":");
+        if (authKeyIdx != -1) {
+            int authStart = authKeyIdx + 7;
+            int authEnd = pending_wifi_payload.indexOf(',', authStart);
+            if (authEnd == -1) authEnd = pending_wifi_payload.indexOf('}', authStart);
+            if (authEnd != -1) {
+                new_auth_mode = pending_wifi_payload.substring(authStart, authEnd).toInt();
+            }
+        }
         if (new_ssid.length() > 0) {
             // If reconnecting to previously saved network with empty password, use previous password
             if (new_ssid == config_ssid && new_pass.length() == 0) {
                 new_pass = config_password;
             }
             Serial.printf("[Remote] Saving new Wi-Fi '%s' and restarting...\n", new_ssid.c_str());
-            saveConfiguration(new_ssid, new_pass, config_server_host, config_auth_token);
+            saveConfiguration(new_ssid, new_pass, config_server_host, config_auth_token, new_auth_mode);
             #if USE_WEBSOCKET
               webSocket.disconnect();
             #endif
@@ -873,18 +1056,13 @@ void loop() {
     if (flag_scan_wifi) {
         flag_scan_wifi = false;
         Serial.println("\n[Remote] Executing SCAN_WIFI request...");
+        if (roaming_scan_active) {
+            WiFi.scanDelete();
+            roaming_scan_active = false;
+        }
         int n = WiFi.scanNetworks();
         Serial.printf("[Remote] Scan found %d networks\n", n);
-        String jsonResp = "SCAN_RESULTS:[";
-        for (int i = 0; i < n; i++) {
-            if (i > 0) jsonResp += ",";
-            String ssid = WiFi.SSID(i);
-            ssid.replace("\"", "\\\"");
-            bool isOpen = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
-            bool isSaved = (WiFi.SSID(i) == config_ssid);
-            jsonResp += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(WiFi.RSSI(i)) + ",\"open\":" + (isOpen ? "true" : "false") + ",\"saved\":" + (isSaved ? "true" : "false") + "}";
-        }
-        jsonResp += "]";
+        String jsonResp = "SCAN_RESULTS:" + groupedScanResultsJson(n);
         #if USE_WEBSOCKET
           webSocket.sendTXT(jsonResp);
         #endif
@@ -913,8 +1091,12 @@ void loop() {
     if (WiFi.status() != WL_CONNECTED) {
         if (wifi_disconnect_start == 0) {
             wifi_disconnect_start = millis();
-            Serial.println("[WiFi] Lost connection. Attempting to reconnect...");
-            WiFi.reconnect();
+            if (roaming_in_progress) {
+                Serial.println("[WiFi] Waiting for roaming connection...");
+            } else {
+                Serial.println("[WiFi] Lost connection. Attempting to reconnect...");
+                WiFi.reconnect();
+            }
         }
 
         // Still drain camera while waiting for reconnect (prevents FB-OVF)
@@ -930,9 +1112,12 @@ void loop() {
         return;
     } else {
         wifi_disconnect_start = 0;
+        roaming_in_progress = false;
     }
 
     unsigned long now = millis();
+
+    checkWifiRoaming(now);
 
     #if USE_WEBSOCKET
       webSocket.loop();

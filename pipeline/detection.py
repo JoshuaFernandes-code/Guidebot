@@ -1,6 +1,12 @@
+import cv2
 from ultralytics import YOLO
+import ultralytics.utils.patches as _patches
 import torch
 from config import CONFIG
+
+# Restore native OpenCV imshow if monkey-patched by ultralytics
+if hasattr(_patches, "_imshow"):
+    cv2.imshow = _patches._imshow
 
 class Detector:
     def __init__(self):
