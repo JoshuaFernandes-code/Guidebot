@@ -9,10 +9,7 @@ class OCRReader:
         print("[OCR] EasyOCR loaded")
 
     def read_frame(self, frame):
-        # Camera feed is mirrored — flip before reading so text orientation is correct
-        flipped = cv2.flip(frame, 1)
-
-        results = self.reader.readtext(flipped)
+        results = self.reader.readtext(frame)
 
         boxes = []
         for (bbox, text, confidence) in results:

@@ -78,6 +78,9 @@ class Stream:
             if frame is None or frame.size == 0:
                 return False
 
+            if CONFIG.get("flip_horizontal", True):
+                frame = cv2.flip(frame, 1)
+
             with self.lock:
                 self.latest_frame = frame
                 self.latest_timestamp = time.time()
@@ -97,6 +100,22 @@ class Stream:
         app = FastAPI(title="GuideBot Stream Ingestion Server", docs_url=None, redoc_url=None)
         self.app = app
 
+        def render_nav_tabs(active_tab: str) -> str:
+            use_web_mic = CONFIG.get("use_web_mic", False)
+            tabs = [
+                ("home", "/", "🏠 Home"),
+                ("esp", "/esp", "📡 ESP Control"),
+                ("faces", "/faces", "🧑‍🤝‍🧑 Faces"),
+            ]
+            if use_web_mic:
+                tabs.append(("audio", "/audio", "🎤 Voice Input"))
+
+            links = []
+            for tid, path, label in tabs:
+                cls = "app-tab active" if tid == active_tab else "app-tab"
+                links.append(f'<a href="{path}" class="{cls}">{label}</a>')
+            return f'<nav class="app-nav-bar">{"".join(links)}</nav>'
+
         @app.get("/")
         def home(request: Request):
             accept = request.headers.get("accept", "")
@@ -107,8 +126,9 @@ class Stream:
                 return health()
 
             use_web_mic = CONFIG.get("use_web_mic", False)
-            audio_link = '<a href="/audio" class="nav-card">🎤<span>Voice Input</span></a>' if use_web_mic else \
+            audio_link = '<a href="/audio" class="nav-card">🎤<span>Voice Input</span><small>Web Audio recording</small></a>' if use_web_mic else \
                          '<div class="nav-card disabled">🎤<span>Voice Input</span><small>USE_WEB_MIC=false</small></div>'
+            nav_html = render_nav_tabs("home")
             html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -121,7 +141,22 @@ class Stream:
       --text: #f1f5f9; --muted: #94a3b8; --primary: #3b82f6;
     }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }}
-    body {{ background: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; }}
+    body {{ background: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: 80px 16px 32px 16px; -webkit-font-smoothing: antialiased; }}
+    
+    .app-nav-bar {{
+      position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 1000;
+      display: inline-flex; align-items: center; gap: 6px;
+      background: rgba(19, 21, 28, 0.92); border: 1px solid var(--border);
+      border-radius: 999px; padding: 6px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      box-shadow: 0 8px 30px rgba(0,0,0,0.55);
+    }}
+    .app-tab {{
+      padding: 8px 18px; border-radius: 999px; text-decoration: none; color: #94a3b8;
+      font-size: 13px; font-weight: 600; transition: all 0.15s; white-space: nowrap;
+    }}
+    .app-tab:hover {{ color: #fff; background: rgba(255,255,255,0.08); }}
+    .app-tab.active {{ background: var(--primary); color: #fff; box-shadow: 0 2px 10px rgba(59,130,246,0.45); }}
+
     h1 {{ font-size: 28px; font-weight: 800; margin-bottom: 6px; }}
     p.sub {{ color: var(--muted); font-size: 14px; margin-bottom: 40px; }}
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; width: 100%; max-width: 640px; }}
@@ -140,6 +175,7 @@ class Stream:
   </style>
 </head>
 <body>
+  {nav_html}
   <h1>🦯 GuideBot</h1>
   <p class="sub">AI-powered navigation assistant — server is <span class="status-dot"></span>online</p>
   <div class="grid">
@@ -263,6 +299,7 @@ class Stream:
 
             @app.get("/audio", response_class=HTMLResponse)
             def audio_control_panel():
+                nav_html = render_nav_tabs("audio")
                 html = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -283,7 +320,22 @@ class Stream:
       --success: #10b981;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }
-    body { background: var(--bg); color: var(--text); padding: 24px 16px; display: flex; justify-content: center; }
+    body { background: var(--bg); color: var(--text); padding: 80px 16px 32px 16px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; min-height: 100vh; -webkit-font-smoothing: antialiased; }
+    
+    .app-nav-bar {
+      position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 1000;
+      display: inline-flex; align-items: center; gap: 6px;
+      background: rgba(19, 21, 28, 0.92); border: 1px solid var(--border);
+      border-radius: 999px; padding: 6px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      box-shadow: 0 8px 30px rgba(0,0,0,0.55);
+    }
+    .app-tab {
+      padding: 8px 18px; border-radius: 999px; text-decoration: none; color: #94a3b8;
+      font-size: 13px; font-weight: 600; transition: all 0.15s; white-space: nowrap;
+    }
+    .app-tab:hover { color: #fff; background: rgba(255,255,255,0.08); }
+    .app-tab.active { background: var(--primary); color: #fff; box-shadow: 0 2px 10px rgba(59,130,246,0.45); }
+
     .card { background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 28px; width: 100%; max-width: 440px; box-shadow: 0 16px 40px rgba(0,0,0,0.5); }
     h1 { font-size: 20px; font-weight: 700; text-align: center; margin-bottom: 4px; }
     p.sub { font-size: 13px; color: var(--text-muted); text-align: center; margin-bottom: 24px; }
@@ -329,6 +381,7 @@ class Stream:
   </style>
 </head>
 <body>
+  {{NAV_BAR}}
   <div class="card">
     <h1>GuideBot Voice Input</h1>
     <p class="sub">Speak or trigger commands remotely</p>
@@ -466,7 +519,7 @@ class Stream:
   </script>
 </body>
 </html>"""
-                return HTMLResponse(content=html)
+                return HTMLResponse(content=html.replace("{{NAV_BAR}}", nav_html))
 
             @app.post("/audio/command")
             async def submit_audio_command(request: Request):
@@ -504,6 +557,7 @@ class Stream:
         @app.get("/esp", response_class=HTMLResponse)
         def esp_control_panel():
             current_ssid = self.esp_current_ssid or ""
+            nav_html = render_nav_tabs("esp")
             html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -525,7 +579,22 @@ class Stream:
       --warning: #f59e0b;
     }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }}
-    body {{ background: var(--bg); color: var(--text); padding: 28px 16px; display: flex; justify-content: center; -webkit-font-smoothing: antialiased; }}
+    body {{ background: var(--bg); color: var(--text); padding: 80px 16px 32px 16px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; min-height: 100vh; -webkit-font-smoothing: antialiased; }}
+    
+    .app-nav-bar {{
+      position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 1000;
+      display: inline-flex; align-items: center; gap: 6px;
+      background: rgba(19, 21, 28, 0.92); border: 1px solid var(--border);
+      border-radius: 999px; padding: 6px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      box-shadow: 0 8px 30px rgba(0,0,0,0.55);
+    }}
+    .app-tab {{
+      padding: 8px 18px; border-radius: 999px; text-decoration: none; color: #94a3b8;
+      font-size: 13px; font-weight: 600; transition: all 0.15s; white-space: nowrap;
+    }}
+    .app-tab:hover {{ color: #fff; background: rgba(255,255,255,0.08); }}
+    .app-tab.active {{ background: var(--primary); color: #fff; box-shadow: 0 2px 10px rgba(59,130,246,0.45); }}
+
     .card {{ background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 28px; width: 100%; max-width: 460px; box-shadow: 0 16px 40px rgba(0,0,0,0.5); }}
     .header {{ text-align: center; margin-bottom: 24px; }}
     h1 {{ font-size: 20px; font-weight: 700; color: #fff; margin-bottom: 4px; }}
@@ -610,6 +679,7 @@ class Stream:
   </style>
 </head>
 <body>
+  {nav_html}
   <div class="card">
     <div class="header">
       <h1>GuideBot ESP Control Panel</h1>
@@ -1021,6 +1091,7 @@ class Stream:
         # -------------------------------------------------------------
         @app.get("/faces", response_class=HTMLResponse)
         def faces_panel():
+            nav_html = render_nav_tabs("faces")
             html = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1035,7 +1106,22 @@ class Stream:
       --danger-hover: #dc2626; --warning: #f59e0b;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }
-    body { background: var(--bg); color: var(--text); padding: 24px 16px; display: flex; justify-content: center; }
+    body { background: var(--bg); color: var(--text); padding: 80px 16px 32px 16px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; min-height: 100vh; -webkit-font-smoothing: antialiased; }
+    
+    .app-nav-bar {
+      position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 1000;
+      display: inline-flex; align-items: center; gap: 6px;
+      background: rgba(19, 21, 28, 0.92); border: 1px solid var(--border);
+      border-radius: 999px; padding: 6px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      box-shadow: 0 8px 30px rgba(0,0,0,0.55);
+    }
+    .app-tab {
+      padding: 8px 18px; border-radius: 999px; text-decoration: none; color: #94a3b8;
+      font-size: 13px; font-weight: 600; transition: all 0.15s; white-space: nowrap;
+    }
+    .app-tab:hover { color: #fff; background: rgba(255,255,255,0.08); }
+    .app-tab.active { background: var(--primary); color: #fff; box-shadow: 0 2px 10px rgba(59,130,246,0.45); }
+
     .card { background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 28px; width: 100%; max-width: 520px; box-shadow: 0 16px 40px rgba(0,0,0,0.5); }
     .header { text-align: center; margin-bottom: 28px; }
     h1 { font-size: 21px; font-weight: 800; margin-bottom: 4px; }
@@ -1137,6 +1223,7 @@ class Stream:
   </style>
 </head>
 <body>
+  {{NAV_BAR}}
   <div class="card">
     <a href="/" class="back-link">← Back to Dashboard</a>
     <div class="header">
@@ -1458,7 +1545,7 @@ class Stream:
   </script>
 </body>
 </html>"""
-            return HTMLResponse(content=html)
+            return HTMLResponse(content=html.replace("{{NAV_BAR}}", nav_html))
 
         @app.get("/faces/list")
         def faces_list():
@@ -1623,6 +1710,9 @@ class Stream:
                 continue
 
             fail_count = 0
+            if CONFIG.get("flip_horizontal", True):
+                frame = cv2.flip(frame, 1)
+
             with self.lock:
                 self.latest_frame = frame
                 self.latest_timestamp = time.time()

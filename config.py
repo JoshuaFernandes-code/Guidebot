@@ -15,6 +15,8 @@ CONFIG = {
     # When True: server tells ESP32 to always use VGA regardless of network speed.
     # When False (default): ESP32 auto-downgrades to QVGA on slow networks.
     "force_high_res": os.getenv("FORCE_HIGH_RES", "false").strip().lower() in ("1", "true", "yes"),
+    # When True (default): un-mirrors (horizontally flips) incoming camera frames for normal perspective.
+    "flip_horizontal": os.getenv("FLIP_HORIZONTAL", "true").strip().lower() in ("1", "true", "yes"),
     "stream_url": "http://10.254.76.220/stream",
     "stream_timeout": 10,
     "display_width": 800,

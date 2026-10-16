@@ -281,6 +281,9 @@ def main():
             if (key & 0xFF == ord('q')) or is_window_closed("GuideBot"):
                 break
 
+        except KeyboardInterrupt:
+            print("\n[GuideBot] Application terminated by user (Ctrl+C). Cleaning up...")
+            break
         except cv2.error as e:
             print(f"[GuideBot] OpenCV display error (recovered): {e}")
             continue
@@ -296,4 +299,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[GuideBot] User killed application (Ctrl+C).")
