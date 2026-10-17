@@ -45,10 +45,12 @@ class VoiceInput:
         try:
             result = self.model.transcribe(file_path_or_bytes, fp16=False, language="en")
             text = result["text"].strip().lower()
-            if text:
+            clean = text.rstrip(".?!,")
+            NOISE = {"", ".", "..", "...", "you", "thank you", "subtitles", "the", "a"}
+            if clean and clean not in NOISE and len(clean) >= 2:
                 print(f"[Voice / Web] Transcribed audio: '{text}'")
-                self.command_queue.put(text)
-                return text
+                self.command_queue.put(clean)
+                return clean
             return ""
         except Exception as e:
             print(f"[Voice / Web] Transcription error: {e}")
@@ -69,6 +71,7 @@ class VoiceInput:
 
     def _listen_loop(self):
         fail_count = 0
+        NOISE = {"", ".", "..", "...", "you", "thank you", "subtitles", "the", "a"}
         while self.running:
             try:
                 audio = self._record_audio()
@@ -80,10 +83,11 @@ class VoiceInput:
 
                 result = self.model.transcribe(audio, fp16=False, language="en")
                 text = result["text"].strip().lower()
+                clean = text.rstrip(".?!,")
 
-                if text:
-                    print(f"[Voice] Heard: '{text}'")
-                    self.command_queue.put(text)
+                if clean and clean not in NOISE and len(clean) >= 2:
+                    print(f"[Voice] Heard: '{clean}'")
+                    self.command_queue.put(clean)
 
             except Exception as e:
                 fail_count += 1

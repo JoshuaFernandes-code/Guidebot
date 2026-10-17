@@ -30,25 +30,19 @@ class LLMAssistant:
     """
 
     DEFAULT_SYSTEM_PROMPT = (
-        "You are GuideBot, an intelligent and empathetic AI assistant built into a wearable "
-        "smart navigation aid for visually impaired users. "
-        "Your answers will be spoken aloud to the user via Text-to-Speech (TTS). "
-        "Guidelines:\n"
-        "1. Keep responses concise, direct, and conversational (1 to 2 sentences maximum).\n"
-        "2. Do NOT use markdown, emojis, asterisks, bullet points, quotes, or special characters—only plain speakable text.\n"
-        "3. NEVER say robotic meta-statements like 'I have no visual data' or 'According to my context'. "
-        "Speak naturally as a sighted guide walking alongside them.\n"
-        "4. Always carefully check the 'Current visible objects' list in your prompt. If the user asks about something "
-        "(e.g., drinks, chairs, people) and a matching or related object is listed (like a bottle, cup, chair, or person), "
-        "tell them where it is and how far away it is. If nothing related is listed, tell them you don't see it right in front of them right now.\n"
-        "5. If the user corrects you or tells you about distances or who is present, acknowledge their feedback warmly and naturally.\n"
-        "6. Be reassuring, helpful, and natural."
+        "You are GuideBot, an intelligent and empathetic wearable smart navigation assistant for a visually impaired user. "
+        "Your answers are spoken aloud to the user via Text-to-Speech (TTS).\n"
+        "CRITICAL RULES:\n"
+        "1. Keep responses under 15 words. Be direct, crisp, and conversational.\n"
+        "2. NEVER use markdown, formatting, asterisks, bullet points, emojis, or quotes. Output only plain speakable text.\n"
+        "3. Base your answer strictly on the 'Current visible objects' provided. If an object is not in the visible list, state clearly that you do not see it.\n"
+        "4. Never hallucinate or invent objects that are not listed in the current camera view."
     )
 
     def __init__(
         self,
         ollama_url: str = "http://127.0.0.1:11434",
-        model: str = "llama3.2:3b",
+        model: str = "llama3.2:1b",
         enabled: bool = True,
         auto_start: bool = True,
         tts_callback = None
@@ -214,9 +208,10 @@ class LLMAssistant:
         # Generic helpful guidebot response
         return "I am with you. You can ask what is ahead, left, right, say 'read' for text, or 'who' for faces."
 
-    def _build_context_prompt(self, user_query: str) -> str:
+    def _build_context_prompt(self, user_query: str, fresh_detections: Optional[List[Dict[str, Any]]] = None) -> str:
         with self._lock:
-            dets = list(self._last_detections)
+            # Prefer fresh_detections passed at call time (from the live frame) over stale cache
+            dets = list(fresh_detections) if fresh_detections is not None else list(self._last_detections)
             tts_hist = list(self._history_tts)
             last_ocr = self._last_ocr
             last_face = self._last_face
@@ -252,11 +247,12 @@ class LLMAssistant:
             f"Respond concisely as GuideBot (do not mention data or context, speak naturally about what you see or don't see):"
         )
 
-    def ask(self, user_query: str, on_response=None):
+    def ask(self, user_query: str, on_response=None, fresh_detections: Optional[List[Dict[str, Any]]] = None):
         """
         Asynchronously ask the LLM. If on_response is not provided, defaults to self.tts_callback.
         Non-blocking: spawns background daemon thread so main loop remains smooth.
         If Ollama is offline or uninstalled, automatically provides an intelligent spatial fallback.
+        fresh_detections: pass the live detection list from the current frame for maximum accuracy.
         """
         if not self.enabled:
             return
@@ -281,15 +277,15 @@ class LLMAssistant:
                         target_cb(fallback_reply)
                     return
 
-                prompt = self._build_context_prompt(user_query)
+                prompt = self._build_context_prompt(user_query, fresh_detections=fresh_detections)
                 payload = {
                     "model": self.model,
                     "prompt": prompt,
                     "system": self.DEFAULT_SYSTEM_PROMPT,
                     "stream": False,
                     "options": {
-                        "temperature": 0.6,
-                        "num_predict": 75,  # Keep responses crisp and concise
+                        "temperature": 0.3,   # More deterministic / factual, less rambling
+                        "num_predict": 40,    # ~40 tokens ≈ 1–2 short sentences, <0.8s on CPU
                     }
                 }
                 data = json.dumps(payload).encode("utf-8")

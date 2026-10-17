@@ -5,6 +5,7 @@ import json
 import asyncio
 import os
 import base64
+import queue
 import numpy as np
 from config import CONFIG
 from pipeline import faces_db
@@ -18,10 +19,11 @@ except ImportError:
     FastAPI = None
 
 class Stream:
-    def __init__(self, voice_input=None, face_recognizer=None):
+    def __init__(self, voice_input=None, face_recognizer=None, tts=None):
         self.mode = CONFIG.get("stream_mode", "push_receiver")
         self.voice_input = voice_input
         self.face_recognizer = face_recognizer  # FaceRecognizer ref for hot-reload after face add/delete
+        self.tts = tts                          # TTS ref for Acoustic Echo Cancellation (speaking gate)
         self._face_reload_lock = threading.Lock()
         self.latest_frame = None
         self.latest_timestamp = 0
@@ -36,16 +38,20 @@ class Stream:
         self.dash_clients = set()
         self.pending_scan_future = None
 
-        # ESP32 mic utterance buffering: the firmware streams ~100 ms PCM chunks
-        # (far too short for Whisper, which returns empty text on such clips), so
-        # voiced chunks are accumulated here and transcribed as one utterance
-        # when speech pauses or the window cap is reached.
+        # ESP32 mic utterance buffering: the firmware streams ~100 ms PCM chunks.
+        # Voiced chunks are accumulated here with DC bias removed and flushed
+        # to a dedicated background Whisper worker when speech pauses.
         self._esp_audio_chunks: list = []
         self._esp_audio_last_voiced = 0.0
         self._esp_audio_log_ts = 0.0
-        self._esp_audio_gap_s = 0.9    # silence this long (s) ends an utterance
-        self._esp_audio_max_s = 8.0    # hard cap on buffered utterance length (s)
-        self._esp_audio_min_s = 0.4    # shorter buffers are noise — skip them
+        self._esp_audio_gap_s = 0.45   # halved from 0.9s for 2x faster end-of-speech response
+        self._esp_audio_max_s = 6.0    # cap on buffered utterance length (s)
+        self._esp_audio_min_s = 0.25   # shorter buffers are noise — skip them
+
+        # Dedicated background transcription worker queue (decoupled from audio ingest)
+        self._transcribe_queue = queue.Queue()
+        self._transcribe_thread = threading.Thread(target=self._transcription_worker, daemon=True)
+        self._transcribe_thread.start()
 
         # TTS WebSocket broadcast subscribers
         self.tts_clients: set = set()
@@ -93,8 +99,7 @@ class Stream:
             if frame is None or frame.size == 0:
                 return False
 
-            if CONFIG.get("flip_horizontal", True):
-                frame = cv2.flip(frame, 1)
+            frame = cv2.flip(frame, 1)  # always un-mirror the wearable camera
 
             with self.lock:
                 self.latest_frame = frame
@@ -122,6 +127,11 @@ class Stream:
         if self.voice_input is None:
             print("[ESP32 Mic] Warning: voice_input not wired to Stream; dropping audio.")
             return
+
+        # 1. Acoustic Echo Cancellation (AEC): Drop audio chunks while GuideBot is speaking
+        if self.tts and self.tts.is_active():
+            return
+
         try:
             import base64
             raw = base64.b64decode(audio_b64)
@@ -133,19 +143,24 @@ class Stream:
             if pcm_int16.size == 0:
                 return
             audio = pcm_int16.astype(np.float32) / 32768.0
+
+            # 2. Remove PDM MEMS DC bias: raw PDM decimation filter introduces a
+            # static DC bias (~1800 counts = ~0.05 float). Removing the mean brings
+            # ambient silence down to ~0.001-0.003 RMS, solving continuous false VAD triggers!
+            audio_ac = audio - np.mean(audio)
+
             sample_rate = int(CONFIG.get("esp32_mic_sample_rate", 16000))
-            vad_threshold = float(CONFIG.get("esp32_mic_vad_threshold", 0.005))
-            rms = float(np.sqrt(np.mean(audio ** 2))) if audio.size else 0.0
+            vad_threshold = float(CONFIG.get("esp32_mic_vad_threshold", 0.015))
+            rms = float(np.sqrt(np.mean(audio_ac ** 2))) if audio_ac.size else 0.0
             now = time.time()
 
             # Chunks arrive continuously even during silence, so a gap since the
-            # last voiced chunk means the utterance ended — flush it before
-            # starting the next one.
+            # last voiced chunk means the utterance ended — flush it to background worker.
             if self._esp_audio_chunks and (now - self._esp_audio_last_voiced) >= self._esp_audio_gap_s:
                 self._flush_esp32_utterance("speech gap")
 
             # Throttled diagnostic (~every 2 s): shows whether audio is arriving
-            # and whether RMS clears the VAD gate — use it to tune the threshold.
+            # and whether RMS clears the VAD gate.
             if now - self._esp_audio_log_ts >= 2.0:
                 self._esp_audio_log_ts = now
                 buffered = sum(c.size for c in self._esp_audio_chunks) / sample_rate
@@ -155,7 +170,7 @@ class Stream:
             if rms < vad_threshold:
                 return
 
-            self._esp_audio_chunks.append(audio)
+            self._esp_audio_chunks.append(audio_ac)
             self._esp_audio_last_voiced = now
             buffered = sum(c.size for c in self._esp_audio_chunks) / sample_rate
             if buffered >= self._esp_audio_max_s:
@@ -164,7 +179,8 @@ class Stream:
             print(f"[ESP32 Mic] Error processing ESP32 audio: {e}")
 
     def _flush_esp32_utterance(self, reason: str):
-        """Transcribe the buffered ESP32 utterance and queue the resulting text."""
+        """Dispatches the buffered ESP32 utterance to the background transcription worker queue.
+        Non-blocking: returns in <0.1ms so incoming frames and audio are never stalled."""
         if not self._esp_audio_chunks:
             return
         chunks, self._esp_audio_chunks = self._esp_audio_chunks, []
@@ -172,16 +188,52 @@ class Stream:
         sample_rate = int(CONFIG.get("esp32_mic_sample_rate", 16000))
         seconds = audio.size / sample_rate
         if seconds < self._esp_audio_min_s:
-            return  # too short to be real speech — Whisper would return garbage
-        print(f"[ESP32 Mic] Transcribing {seconds:.1f}s utterance ({reason})...")
-        # Reuse the same Whisper model already loaded by VoiceInput
-        result = self.voice_input.model.transcribe(audio, fp16=False, language="en")
-        text = result.get("text", "").strip().lower()
-        if text:
-            print(f"[ESP32 Mic] Heard: '{text}'")
-            self.voice_input.command_queue.put(text)
-        else:
-            print(f"[ESP32 Mic] Whisper returned no text for {seconds:.1f}s utterance ({reason})")
+            return  # too short to be real speech — discard noise blip
+
+        # Non-blocking handoff to background worker
+        self._transcribe_queue.put((audio, seconds, reason))
+
+    def _transcription_worker(self):
+        """Dedicated background thread for Whisper transcription.
+        Decoupled from audio ingestion to prevent freezing the event loop or camera ingest."""
+        while self.running:
+            try:
+                item = self._transcribe_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if item is None:
+                break
+
+            audio, seconds, reason = item
+            if self.voice_input is None or getattr(self.voice_input, "model", None) is None:
+                continue
+
+            try:
+                t0 = time.time()
+                # Run Whisper transcription
+                result = self.voice_input.model.transcribe(audio, fp16=False, language="en")
+                dur = time.time() - t0
+                raw_text = result.get("text", "").strip()
+                clean_text = raw_text.lower().rstrip(".?!,")
+
+                # Noise filter: Discard empty, single-character, or common silence hallucination artifacts
+                NOISE_ARTIFACTS = {
+                    "", ".", "..", "...", "you", "thank you", "thank you.", "subtitles by",
+                    "subtitles", "thanks for watching", "bye", "amara.org", "the", "a"
+                }
+                if clean_text in NOISE_ARTIFACTS or len(clean_text) < 2:
+                    continue
+
+                # Echo rejection: Discard text if it matches what GuideBot spoke recently
+                if self.tts and self.tts.is_echo(clean_text):
+                    print(f"[ESP32 Mic] Discarded self-echo: '{raw_text}'")
+                    continue
+
+                print(f"[ESP32 Mic] Heard in {dur:.2f}s ({reason}): '{raw_text}'")
+                self.voice_input.command_queue.put(clean_text)
+            except Exception as e:
+                print(f"[ESP32 Mic] Transcription worker error: {e}")
 
     def _start_push_receiver(self):
         if FastAPI is None or uvicorn is None:
@@ -371,9 +423,11 @@ class Stream:
             # Broadcast connected status to all /esp dashboard WebSocket clients
             await broadcast_esp_status(True)
 
-            # Immediately tell the ESP32 whether to force high-res or use adaptive mode
-            force_high_res = CONFIG.get("force_high_res", False)
-            cmd = "FORCE_HIGH_RES:1" if force_high_res else "FORCE_HIGH_RES:0"
+            # Tell the ESP32 whether it may downgrade to QVGA on slow networks.
+            # allow_low_res=False (default) → force VGA always (FORCE_HIGH_RES:1)
+            # allow_low_res=True           → let ESP32 adapt     (FORCE_HIGH_RES:0)
+            allow_low_res = CONFIG.get("allow_low_res", False)
+            cmd = "FORCE_HIGH_RES:0" if allow_low_res else "FORCE_HIGH_RES:1"
             await websocket.send_text(cmd)
             print(f"[Stream Receiver] Sent resolution command to ESP32: {cmd}")
 
@@ -2092,8 +2146,7 @@ class Stream:
                 continue
 
             fail_count = 0
-            if CONFIG.get("flip_horizontal", True):
-                frame = cv2.flip(frame, 1)
+            frame = cv2.flip(frame, 1)  # always un-mirror the wearable camera
 
             with self.lock:
                 self.latest_frame = frame
@@ -2117,6 +2170,8 @@ class Stream:
 
     def release(self):
         self.running = False
+        if hasattr(self, "_transcribe_queue"):
+            self._transcribe_queue.put(None)
 
         if self.server:
             try:

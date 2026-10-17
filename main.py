@@ -155,8 +155,9 @@ def main():
     tts             = TTS()
     ocr_reader      = OCRReader()
     face_recognizer = FaceRecognizer()
+    # Pass tts reference so Stream can mute mic while GuideBot is speaking (AEC gate)
     # Pass face_recognizer so /faces API can hot-reload embeddings after add/delete
-    stream          = Stream(voice_input=voice_input, face_recognizer=face_recognizer)
+    stream          = Stream(voice_input=voice_input, face_recognizer=face_recognizer, tts=tts)
 
     # Wire TTS → Stream: broadcast spoken text to /ws/tts-feed web clients
     tts.set_broadcast(stream.broadcast_tts_text)
@@ -164,11 +165,15 @@ def main():
     # Local LLM Assistant (Ollama)
     llm = LLMAssistant(
         ollama_url=CONFIG.get("llm_url", "http://127.0.0.1:11434"),
-        model=CONFIG.get("llm_model", "llama3.2:3b"),
-        enabled=CONFIG.get("llm_enabled", True),
+        model=CONFIG.get("llm_model", "llama3.2:1b"),
+        enabled=CONFIG.get("llm_enabled", False),
         auto_start=CONFIG.get("llm_auto_start", True),
         tts_callback=tts.speak,
     )
+    if llm.enabled:
+        print(f"[LLM] Conversational assistant ENABLED (model: {llm.model})")
+    else:
+        print("[LLM] Conversational assistant DISABLED (set LLM_ENABLED=true in .env to activate)")
 
     inference = InferencePipeline(stream, detector, depth_estimator, decision_engine)
 
@@ -235,7 +240,8 @@ def main():
             # ------------------------------------------------------------------
             # Audio / Decision engine (non-blocking: uses last known detections)
             # ------------------------------------------------------------------
-            llm.update_detections(detections)
+            if llm.enabled:
+                llm.update_detections(detections)
 
             messages = decision_engine.decide(detections)
             for message in messages:
@@ -275,13 +281,28 @@ def main():
                 elif cmd_clean in DIRECT_RIGHT or (num_words <= 4 and "right" in words and any(w in words for w in ["what", "whats", "what's", "is", "on", "check"])):
                     query = "right"
 
-                # 2. Fast OCR Queries
+                # 2. Fast Scene Description Queries (e.g. "what do you see", "describe scene")
+                is_scene_query = (
+                    cmd_clean in {
+                        "what do you see", "what do you see now", "what can you see",
+                        "what are you looking at", "what are you seeing", "describe",
+                        "describe scene", "describe the scene", "describe what you see",
+                        "what is there", "whats there", "what's there",
+                        "what is around", "whats around", "what's around", "what is around me",
+                        "look around", "what is in view", "tell me what you see"
+                    } or
+                    ("see" in words and any(w in words for w in ["what", "whats", "what's", "can", "do"])) or
+                    (num_words <= 3 and "describe" in words) or
+                    ("around" in words and any(w in words for w in ["what", "whats", "what's", "look"]))
+                )
+
+                # 3. Fast OCR Queries
                 is_ocr_query = (
                     cmd_clean in {"read", "read text", "read this", "read sign", "read sign board", "read the text"} or
                     (num_words <= 3 and "read" in words)
                 )
 
-                # 3. Fast Face Identification Queries
+                # 4. Fast Face Identification Queries
                 is_face_query = (
                     cmd_clean in {"who", "who is this", "who is that", "who is here", "who are you looking at", "identify face", "who is in front"} or
                     (num_words <= 4 and "who" in words and any(w in words for w in ["this", "that", "here", "is"]))
@@ -289,6 +310,12 @@ def main():
 
                 if query:
                     response = decision_engine.answer_query(query, detections, frame_width)
+                    print(f"[GuideBot Speaking] {response}")
+                    tts.speak(response)
+                    llm.update_tts_history(response)
+                elif is_scene_query:
+                    # Instant, zero-latency, 100% accurate visual answer from current frame
+                    response = decision_engine.describe_scene(detections, frame_width)
                     print(f"[GuideBot Speaking] {response}")
                     tts.speak(response)
                     llm.update_tts_history(response)
@@ -307,9 +334,13 @@ def main():
                     llm.update_tts_history(face_result)
                     llm.update_face(face_result)
                 else:
-                    # 4. Conversational / Feedback / Contextual statement -> Route to Local LLM Assistant
+                    # 5. Conversational / Contextual Question -> Route to Local LLM Assistant
+                    # Discard single-word filler words or noise fragments
+                    if num_words <= 1 and words[0] in {"you", "the", "a", "it", "so", "oh", "yeah", "yes", "no", "uh", "um", "bye"}:
+                        continue
                     print(f"[Voice / LLM] Conversational query routed to assistant: '{command}'")
-                    llm.ask(command)
+                    # Pass fresh current detections so LLM sees what camera sees right this instant
+                    llm.ask(command, fresh_detections=detections)
 
             # ------------------------------------------------------------------
             # FPS Overlay: Inference FPS Badge

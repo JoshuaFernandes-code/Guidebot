@@ -14,8 +14,12 @@ An AI-powered wearable navigation assistant for people who are blind or losing t
 - **Object Detection:** Real-time object recognition (YOLOv8/v11).
 - **Depth Estimation:** Distance estimation classified into Close / Medium / Far (MiDaS).
 - **Audio & Spoken Alerts:** Spoken hazard warnings with directional cues (pyttsx3).
-- **Voice Commands:** Spoken queries for navigation guidance (OpenAI Whisper) via host microphone or browser Web Audio interface (`/audio`).
-- **Remote ESP Management Dashboard (`/esp`):** Scan & switch Wi-Fi networks, reboot, and wipe credentials into hotspot mode remotely over the tunnel without physical access. Smart password handling: open networks hide the password field; previously saved networks allow blank password to reuse stored credentials; new secured networks require a password before connecting.
+- **Voice Commands & Hardware Mic Streaming:** Spoken queries for navigation guidance (OpenAI Whisper) supported via three flexible input modes:
+  - **ESP32-S3 Sense Onboard Mic:** Live audio streaming directly from the built-in PDM MEMS microphone on the Sense camera expansion board over WebSocket.
+  - **Browser Web Audio:** Dedicated voice command recording page at `/audio`.
+  - **Host PC Mic:** Local sounddevice recording.
+- **Local LLM Conversational Assistant (Ollama):** Optional intelligent assistance powered by a local Ollama instance (e.g. `llama3.2:3b`) for conversational QA and scene inquiries.
+- **Remote ESP Management Dashboard (`/esp`):** Scan & switch Wi-Fi networks, reboot, toggle the microphone, and wipe credentials into hotspot mode remotely over the tunnel without physical access. Smart password handling: open networks hide the password field; previously saved networks allow blank password to reuse stored credentials; new secured networks require a password before connecting.
 - **Captive Portal Wi-Fi Provisioning:** Setup hotspot (`GuideBot-Setup` at `192.168.4.1` / `http://guidebot.local`) for credential configuration with hidden tokens and eye visibility toggles. Same smart password logic as the remote dashboard applies here too.
 - **Text Reading (OCR):** Reads signs and text on demand (EasyOCR).
 - **Face Recognition:** Identifies known individuals (InsightFace) with multi-image person support and real-time hot-reloading.
@@ -26,10 +30,10 @@ An AI-powered wearable navigation assistant for people who are blind or losing t
 
 ## Hardware
 
-- **Camera / Microcontroller:** Seeed Studio XIAO ESP32-S3 Sense (with camera module)
+- **Camera & Microphone Board:** Seeed Studio XIAO ESP32-S3 Sense (equipped with camera daughterboard, microSD slot, and onboard digital PDM MEMS microphone `MSM261D3526H1CPM`)
 - **Host Laptop:** Windows / Linux laptop with an NVIDIA GPU (recommended, developed on RTX 3070 Ti; CPU fallback supported)
 - **Audio Output:** Headphones / Bone-conduction earphones
-- **Audio Input:** USB microphone / Headset mic
+- **Audio Input:** Seeed XIAO ESP32-S3 Sense onboard mic / Browser Web Audio (`/audio`) / USB microphone / Headset mic
 
 ---
 
@@ -107,9 +111,21 @@ STREAM_AUTH_TOKEN=guidebot_secret_token
 # Set to false (default) to let the ESP32 dynamically adapt to QVGA (320x240) on slow networks.
 FORCE_HIGH_RES=false
 
+# Audio Input Options:
+# Set USE_ESP32_MIC=true to stream live audio from the Seeed XIAO Sense onboard PDM mic
+USE_ESP32_MIC=true
+ESP32_MIC_SAMPLE_RATE=16000
+ESP32_MIC_VAD_THRESHOLD=0.005
+
 # Set to true to enable the browser-based Web Voice & Command interface at /audio
-# and disable the local PC microphone thread (solves PortAudio [PaErrorCode -9999] on Windows).
+# and disable the local PC microphone thread.
 USE_WEB_MIC=false
+
+# Local LLM Conversational Assistant (Ollama)
+LLM_ENABLED=true
+LLM_MODEL=llama3.2:3b or llama3.2:1b
+LLM_URL=http://127.0.0.1:11434
+LLM_TIMEOUT=25.0
 ```
 
 ---
@@ -153,21 +169,24 @@ If you are testing on the same local Wi-Fi without any tunnel:
 4. In Arduino IDE, install the required library:
    - Go to **Sketch** -> **Include Library** -> **Manage Libraries...**
    - Search for **WebSockets** by **Markus Sattler** and click **Install**.
-5. Select Board: **XIAO_ESP32S3** (and the matching COM port).
-   - **PSRAM:** `OPI PSRAM` *(Critical: Must be enabled for camera buffers)*
+5. Select Board: **XIAO_ESP32S3** (or `ESP32S3 Dev Module`):
+   - **Board Package:** Ensure `esp32 by Espressif Systems` (v3.0.x or newer) is installed in the Boards Manager.
+   - **PSRAM:** `OPI PSRAM` *(Critical: Must be enabled for camera and audio DMA buffers)*
    - **Flash Mode:** `QIO 80MHz`
+   - **Flash Size:** `8MB (64Mb)`
    - **USB CDC On Boot:** `Enabled`
+   *(Hardware Note: Firmly press the camera/mic daughterboard onto the XIAO ESP32-S3 core board until the board-to-board connector clicks flush).*
 6. Click **Upload**.
 7. **Wi-Fi Setup via Captive Portal:**
    - On first boot (or after an erase), the ESP32 launches an open hotspot: **`GuideBot-Setup`**.
    - Connect your phone or laptop to `GuideBot-Setup` and open `http://192.168.4.1` (or `http://guidebot.local`).
-   - Pick your Wi-Fi network, enter the password, and save. The ESP32 saves credentials to NVS flash and automatically begins streaming to your server.
-   - You can later switch networks, reboot, or wipe credentials remotely anytime via `http://<server-host>/esp`.
+   - Pick your Wi-Fi network, enter the password, and save. The ESP32 saves credentials to NVS flash and automatically begins streaming video and microphone audio to your server.
+   - You can later switch networks, reboot, toggle the mic, or wipe credentials remotely anytime via `http://<server-host>/esp`.
 
 ---
 
 ### 8. Add Known Faces
-Place at least one clear portrait photo (`.jpg` or `.png`) into the `data/known_faces/` folder:
+Place at least one clear portrait photo (`.jpg` or `.png`) into the `data/known_faces/` folder (or upload directly via the web dashboard at `/faces`):
 ```text
 data/known_faces/
     ├── joshua.jpg
@@ -177,7 +196,42 @@ The filename (without extension) will be spoken when GuideBot recognizes that pe
 
 ---
 
-### 9. Run GuideBot
+### 9. Local LLM Setup (Ollama Assistant)
+
+GuideBot includes an on-device conversational AI assistant powered by [Ollama](https://ollama.com). It handles open-ended spoken questions (e.g., *"Is there a chair in front of me?"*, *"Do you see my drink?"*, *"What's around me?"*) by combining real-time visible detections, distance estimates, OCR text, and recognized faces into a direct, speakable response.
+
+#### 1. Install Ollama
+- Download and run the installer for Windows, macOS, or Linux from **[ollama.com/download](https://ollama.com/download)**.
+- Verify the installation by opening a new terminal and running:
+  ```cmd
+  ollama --version
+  ```
+
+#### 2. Pull the Recommended Model
+GuideBot defaults to `llama3.2:3b`, which provides high conversational accuracy while running fast enough on consumer GPUs (or CPU) alongside YOLO and MiDaS:
+```cmd
+ollama pull llama3.2:3b
+```
+*(For machines with limited VRAM or CPU-only setups, lighter models like `llama3.2:1b` or `qwen2.5:1.5b` can also be used by setting `LLM_MODEL` in `.env`).*
+
+#### 3. Service Lifecycle
+- **Automatic:** If `LLM_AUTO_START=true` (the default), GuideBot automatically checks if Ollama is listening at `http://127.0.0.1:11434`. If not, it launches `ollama serve` in the background.
+- **Manual (Optional):** You can also start the Ollama desktop application or run `ollama serve` in a dedicated terminal before starting GuideBot.
+- **Graceful Fallback:** If Ollama is not installed or unreachable, GuideBot logs a clear warning and falls back to rule-based keyword commands without crashing.
+
+#### 4. Configure `.env`
+Verify your settings in `.env`:
+```env
+LLM_ENABLED=true
+LLM_AUTO_START=true
+LLM_MODEL=llama3.2:3b
+LLM_URL=http://127.0.0.1:11434
+LLM_TIMEOUT=25.0
+```
+
+---
+
+### 10. Run GuideBot
 Start GuideBot on your workstation:
 ```cmd
 python main.py
@@ -193,12 +247,14 @@ Press `q` in the video window to quit cleanly.
 - [x] Live video streaming (LAN + Cloudflare Tunnel + VS Code devtunnels)
 - [x] Adaptive resolution for low-bandwidth connections
 - [x] Asynchronous real-time inference pipeline
-- [x] Object detection
-- [x] Depth estimation
-- [x] Decision engine + audio feedback
-- [x] Voice commands
-- [x] Text reading (OCR)
-- [x] Face recognition
+- [x] Object detection (YOLOv8)
+- [x] Depth estimation (MiDaS)
+- [x] Decision engine + audio hazard alerts
+- [x] Voice commands (OpenAI Whisper)
+- [x] ESP32-S3 Sense onboard PDM microphone streaming
+- [x] Text reading (OCR with EasyOCR)
+- [x] Face recognition (InsightFace) + web management dashboard (`/faces`)
+- [x] Local LLM assistant integration (Ollama / Llama 3.2)
 - [ ] Currency recognition
 - [ ] Scene description
 - [ ] Final polish + wearable enclosure build
