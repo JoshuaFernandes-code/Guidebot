@@ -36,6 +36,21 @@ class Stream:
         self.dash_clients = set()
         self.pending_scan_future = None
 
+        # ESP32 mic utterance buffering: the firmware streams ~100 ms PCM chunks
+        # (far too short for Whisper, which returns empty text on such clips), so
+        # voiced chunks are accumulated here and transcribed as one utterance
+        # when speech pauses or the window cap is reached.
+        self._esp_audio_chunks: list = []
+        self._esp_audio_last_voiced = 0.0
+        self._esp_audio_log_ts = 0.0
+        self._esp_audio_gap_s = 0.9    # silence this long (s) ends an utterance
+        self._esp_audio_max_s = 8.0    # hard cap on buffered utterance length (s)
+        self._esp_audio_min_s = 0.4    # shorter buffers are noise — skip them
+
+        # TTS WebSocket broadcast subscribers
+        self.tts_clients: set = set()
+        self._tts_loop = None  # asyncio event loop, captured at first /ws/tts-feed connect
+
         self.auth_token = CONFIG.get("stream_auth_token", "")
         self.host = CONFIG.get("receiver_host", "0.0.0.0")
         self.port = int(CONFIG.get("receiver_port", 8000))
@@ -89,6 +104,84 @@ class Stream:
         except Exception as e:
             print(f"[Stream Receiver] Decode error: {e}")
             return False
+
+    def _process_esp32_audio(self, audio_b64: str):
+        """Decode an ESP32 mic chunk and accumulate it into an utterance buffer.
+
+        The firmware streams ~100 ms PCM chunks at a fixed cadence. Whisper
+        cannot transcribe 100 ms clips — it returns empty text — so voiced
+        chunks are buffered here and flushed to Whisper as one utterance when
+        speech pauses (_esp_audio_gap_s without a voiced chunk) or the window
+        cap is reached.
+
+        All three audio sources (host PC mic, Web UI /audio, ESP32 mic) converge
+        into voice_input.command_queue, so main() needs no changes.
+        """
+        if not CONFIG.get("use_esp32_mic", False):
+            return
+        if self.voice_input is None:
+            print("[ESP32 Mic] Warning: voice_input not wired to Stream; dropping audio.")
+            return
+        try:
+            import base64
+            raw = base64.b64decode(audio_b64)
+            if not raw or len(raw) == 0:
+                return
+
+            # ESP32 sends 16-bit PCM little-endian; convert to float32 [-1, 1]
+            pcm_int16 = np.frombuffer(raw, dtype="<i2")
+            if pcm_int16.size == 0:
+                return
+            audio = pcm_int16.astype(np.float32) / 32768.0
+            sample_rate = int(CONFIG.get("esp32_mic_sample_rate", 16000))
+            vad_threshold = float(CONFIG.get("esp32_mic_vad_threshold", 0.005))
+            rms = float(np.sqrt(np.mean(audio ** 2))) if audio.size else 0.0
+            now = time.time()
+
+            # Chunks arrive continuously even during silence, so a gap since the
+            # last voiced chunk means the utterance ended — flush it before
+            # starting the next one.
+            if self._esp_audio_chunks and (now - self._esp_audio_last_voiced) >= self._esp_audio_gap_s:
+                self._flush_esp32_utterance("speech gap")
+
+            # Throttled diagnostic (~every 2 s): shows whether audio is arriving
+            # and whether RMS clears the VAD gate — use it to tune the threshold.
+            if now - self._esp_audio_log_ts >= 2.0:
+                self._esp_audio_log_ts = now
+                buffered = sum(c.size for c in self._esp_audio_chunks) / sample_rate
+                state = f"voiced, buffered={buffered:.1f}s" if rms >= vad_threshold else "below VAD"
+                print(f"[ESP32 Mic] Chunk RMS={rms:.4f} (VAD={vad_threshold:.4f}) -> {state}")
+
+            if rms < vad_threshold:
+                return
+
+            self._esp_audio_chunks.append(audio)
+            self._esp_audio_last_voiced = now
+            buffered = sum(c.size for c in self._esp_audio_chunks) / sample_rate
+            if buffered >= self._esp_audio_max_s:
+                self._flush_esp32_utterance("max window")
+        except Exception as e:
+            print(f"[ESP32 Mic] Error processing ESP32 audio: {e}")
+
+    def _flush_esp32_utterance(self, reason: str):
+        """Transcribe the buffered ESP32 utterance and queue the resulting text."""
+        if not self._esp_audio_chunks:
+            return
+        chunks, self._esp_audio_chunks = self._esp_audio_chunks, []
+        audio = np.concatenate(chunks)
+        sample_rate = int(CONFIG.get("esp32_mic_sample_rate", 16000))
+        seconds = audio.size / sample_rate
+        if seconds < self._esp_audio_min_s:
+            return  # too short to be real speech — Whisper would return garbage
+        print(f"[ESP32 Mic] Transcribing {seconds:.1f}s utterance ({reason})...")
+        # Reuse the same Whisper model already loaded by VoiceInput
+        result = self.voice_input.model.transcribe(audio, fp16=False, language="en")
+        text = result.get("text", "").strip().lower()
+        if text:
+            print(f"[ESP32 Mic] Heard: '{text}'")
+            self.voice_input.command_queue.put(text)
+        else:
+            print(f"[ESP32 Mic] Whisper returned no text for {seconds:.1f}s utterance ({reason})")
 
     def _start_push_receiver(self):
         if FastAPI is None or uvicorn is None:
@@ -224,6 +317,43 @@ class Stream:
                     dead_clients.add(client)
             self.dash_clients.difference_update(dead_clients)
 
+        def broadcast_tts_text(text: str):
+            """Called from TTS worker thread — schedules async broadcast to all
+            /ws/tts-feed WebSocket clients via the captured asyncio event loop."""
+            if not self.tts_clients or self._tts_loop is None:
+                return
+
+            async def _send():
+                dead = set()
+                msg = json.dumps({"type": "tts", "text": text})
+                for ws in list(self.tts_clients):
+                    try:
+                        await ws.send_text(msg)
+                    except Exception:
+                        dead.add(ws)
+                self.tts_clients.difference_update(dead)
+
+            asyncio.run_coroutine_threadsafe(_send(), self._tts_loop)
+
+        # Store reference so main.py can wire it to TTS
+        self.broadcast_tts_text = broadcast_tts_text
+
+        @app.websocket("/ws/tts-feed")
+        async def tts_feed(websocket: WebSocket):
+            await websocket.accept()
+            self._tts_loop = asyncio.get_running_loop()
+            self.tts_clients.add(websocket)
+            try:
+                while True:
+                    # Keep alive; client sends nothing meaningful
+                    await websocket.receive_text()
+            except WebSocketDisconnect:
+                pass
+            except Exception:
+                pass
+            finally:
+                self.tts_clients.discard(websocket)
+
         @app.websocket("/ws/stream")
         async def websocket_stream(websocket: WebSocket):
             token = websocket.query_params.get("token") or websocket.headers.get("X-Auth-Token")
@@ -246,6 +376,14 @@ class Stream:
             cmd = "FORCE_HIGH_RES:1" if force_high_res else "FORCE_HIGH_RES:0"
             await websocket.send_text(cmd)
             print(f"[Stream Receiver] Sent resolution command to ESP32: {cmd}")
+
+            # If the server is configured to use the ESP32 I2S mic, enable the
+            # device's mic streaming on connect. The ESP32 persists its own mic
+            # state and defaults to OFF, so without this USE_ESP32_MIC=true
+            # would never actually receive any AUDIO_DATA.
+            if CONFIG.get("use_esp32_mic", False):
+                await websocket.send_text("TOGGLE_MIC:1")
+                print("[Stream Receiver] USE_ESP32_MIC=true -> sent TOGGLE_MIC:1 to ESP32.")
 
             try:
                 while self.running:
@@ -274,6 +412,13 @@ class Stream:
                                 print(f"[Stream Receiver] ESP device info: SSID='{self.esp_current_ssid}'")
                             except Exception as parse_err:
                                 print(f"[Stream Receiver] Error parsing DEVICE_INFO: {parse_err}")
+                        elif txt.startswith("AUDIO_DATA:"):
+                            audio_b64 = txt[len("AUDIO_DATA:"):]
+                            # Offload decode + VAD + Whisper to a worker thread.
+                            # Transcription can take seconds; running it inline would
+                            # freeze the asyncio event loop, stalling video frame
+                            # ingest and every other HTTP/WS client.
+                            await asyncio.to_thread(self._process_esp32_audio, audio_b64)
                         else:
                             print(f"[Stream Receiver] Received text message from ESP: {txt}")
             except WebSocketDisconnect:
@@ -378,6 +523,30 @@ class Stream:
     }
     .send-btn:hover { background: var(--primary-hover); }
     .feedback { margin-top: 16px; padding: 12px; border-radius: 10px; background: #132b1a; border: 1px solid #059669; color: #a7f3d0; font-size: 13px; display: none; }
+    .tts-toggle-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+    .tts-toggle-btn {
+      position: relative; width: 46px; height: 26px; border-radius: 999px; border: none; cursor: pointer;
+      background: #222634; transition: background 0.2s; flex-shrink: 0;
+    }
+    .tts-toggle-btn.on { background: var(--success); }
+    .tts-toggle-btn::after {
+      content: ''; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px;
+      border-radius: 50%; background: #fff; transition: transform 0.2s;
+    }
+    .tts-toggle-btn.on::after { transform: translateX(20px); }
+    .tts-log {
+      max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;
+      padding: 4px 0;
+    }
+    .tts-log-item {
+      background: #1a1d27; border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 12px; font-size: 13px; line-height: 1.4; color: var(--text);
+      display: flex; gap: 10px; align-items: flex-start;
+    }
+    .tts-log-time { font-size: 11px; color: var(--text-muted); white-space: nowrap; margin-top: 1px; }
+    .tts-empty { text-align: center; color: var(--text-muted); font-size: 13px; padding: 12px 0; }
+    .tts-speaking-indicator { display: none; font-size: 12px; color: var(--success); margin-left: 8px; }
+    .tts-speaking-indicator.active { display: inline; }
   </style>
 </head>
 <body>
@@ -416,6 +585,18 @@ class Stream:
     </div>
 
     <div id="feedback" class="feedback"></div>
+
+    <div class="divider"></div>
+
+    <!-- Voice Output Section -->
+    <h2>Voice Output <span id="ttsSpeaking" class="tts-speaking-indicator">&#128266; speaking...</span></h2>
+    <div class="tts-toggle-row">
+      <span style="font-size:13px;color:var(--text-muted);">Play GuideBot speech in browser</span>
+      <button id="ttsToggle" class="tts-toggle-btn" onclick="toggleTtsOutput()" title="Enable/disable voice output"></button>
+    </div>
+    <div id="ttsLog" class="tts-log">
+      <div class="tts-empty">Voice output is disabled. Enable above to hear GuideBot.</div>
+    </div>
   </div>
 
   <script>
@@ -515,6 +696,71 @@ class Stream:
       fb.style.borderColor = isErr ? '#ef4444' : '#059669';
       fb.style.color = isErr ? '#fca5a5' : '#a7f3d0';
       setTimeout(() => { fb.style.display = 'none'; }, 4000);
+    }
+
+    // ── TTS Output ─────────────────────────────────────────────
+    let ttsEnabled = false;
+    let ttsWs      = null;
+    let ttsLog     = [];
+
+    function toggleTtsOutput() {
+      ttsEnabled = !ttsEnabled;
+      const btn = document.getElementById('ttsToggle');
+      btn.classList.toggle('on', ttsEnabled);
+      if (ttsEnabled) {
+        connectTtsFeed();
+      } else {
+        if (ttsWs) { ttsWs.close(); ttsWs = null; }
+        window.speechSynthesis.cancel();
+      }
+      updateTtsLog();
+    }
+
+    function connectTtsFeed() {
+      if (ttsWs) return;
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ttsWs = new WebSocket(proto + '://' + location.host + '/ws/tts-feed');
+      ttsWs.onmessage = (evt) => {
+        try {
+          const data = JSON.parse(evt.data);
+          if (data.type === 'tts' && data.text) onTtsMessage(data.text);
+        } catch(e) {}
+      };
+      ttsWs.onclose = () => {
+        ttsWs = null;
+        if (ttsEnabled) setTimeout(connectTtsFeed, 2000);
+      };
+    }
+
+    function onTtsMessage(text) {
+      const ts = new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+      ttsLog.unshift({ text, ts });
+      if (ttsLog.length > 30) ttsLog.pop();
+      updateTtsLog();
+      if (!ttsEnabled) return;
+      window.speechSynthesis.cancel();
+      const utt = new SpeechSynthesisUtterance(text);
+      utt.rate = 1.1;
+      utt.onstart = () => document.getElementById('ttsSpeaking').classList.add('active');
+      utt.onend   = () => document.getElementById('ttsSpeaking').classList.remove('active');
+      window.speechSynthesis.speak(utt);
+    }
+
+    function updateTtsLog() {
+      const logEl = document.getElementById('ttsLog');
+      if (!ttsEnabled || ttsLog.length === 0) {
+        logEl.innerHTML = '<div class="tts-empty">' +
+          (ttsEnabled ? 'Waiting for GuideBot to speak...' : 'Voice output is disabled. Enable above to hear GuideBot.') +
+          '</div>';
+        return;
+      }
+      logEl.innerHTML = ttsLog.map(e =>
+        '<div class="tts-log-item"><span class="tts-log-time">' + e.ts + '</span>' + escHtml(e.text) + '</div>'
+      ).join('');
+    }
+
+    function escHtml(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
   </script>
 </body>
@@ -676,6 +922,17 @@ class Stream:
     .modal-actions button {{ flex: 1; padding: 11px; font-size: 13px; font-weight: 600; border-radius: 9px; border: none; cursor: pointer; }}
     .btn-modal-cancel {{ background: #222634; color: var(--text); }}
     .btn-modal-confirm {{ background: var(--danger); color: #fff; }}
+
+    .switch {{ position: relative; display: inline-block; width: 44px; height: 24px; }}
+    .switch input {{ opacity: 0; width: 0; height: 0; }}
+    .slider {{ position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+      background: #222634; transition: .4s; border-radius: 24px; }}
+    .slider:before {{ position: absolute; content: ""; height: 18px; width: 18px;
+      left: 3px; bottom: 3px; background: #fff; transition: .4s; border-radius: 50%; }}
+    .switch input:checked + .slider {{ background: var(--success); }}
+    .switch input:checked + .slider:before {{ transform: translateX(20px); }}
+
+    .helper {{ font-size: 12px; color: var(--text-muted); margin: 0; }}
   </style>
 </head>
 <body>
@@ -728,6 +985,18 @@ class Stream:
     <div class="section-title">Device Operations</div>
     <button id="rebootBtn" class="btn btn-warning" onclick="openModal('reboot', 'Reboot ESP32?', 'The ESP32 will restart immediately and reconnect using its saved configuration.')">Restart ESP32</button>
     <button id="eraseBtn" class="btn btn-danger" onclick="openModal('erase', 'Erase Wi-Fi & Launch Hotspot?', 'This will wipe all stored Wi-Fi credentials from ESP flash and restart it in GuideBot-Setup hotspot mode.')">Erase Wi-Fi & Launch Hotspot</button>
+    <div class="field-group" style="margin-top:12px;">
+      <label style="display:flex; justify-content:space-between; align-items:center;">
+        <span>ESP32 Microphone</span>
+        <label class="switch" style="margin:0;">
+          <input type="checkbox" id="micToggle" onchange="toggleMic(this)">
+          <span class="slider"></span>
+        </label>
+      </label>
+      <p class="helper" style="font-size:12px; margin-top:4px; color:var(--text-muted);">
+        Enable/disable I2S microphone audio streaming from ESP32-S3 Sense.
+      </p>
+    </div>
 
     <div id="feedback" class="feedback"></div>
   </div>
@@ -921,6 +1190,32 @@ class Stream:
       }}
     }}
 
+    async function toggleMic() {{
+      if (!isConnected) return;
+      const btn = document.getElementById('micToggleBtn');
+      const currentlyOn = btn.classList.contains('btn-warning');
+      const newState = !currentlyOn;
+      showFeedback(`Turning ESP32 mic ${{newState ? 'ON' : 'OFF'}}...`);
+      try {{
+        const res = await fetch("/esp/toggle_mic", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ enabled: newState }})
+        }});
+        const data = await res.json();
+        if (data.status === "ok") {{
+          btn.classList.toggle('btn-warning', newState);
+          btn.classList.toggle('btn-info', !newState);
+          btn.innerText = newState ? "🎤 ESP32 Mic: ON" : "🎤 Toggle ESP32 Mic";
+          showFeedback(`ESP32 mic ${{data.message}}`);
+        }} else {{
+          showFeedback(data.detail || "Failed to toggle mic.", true);
+        }}
+      }} catch (err) {{
+        showFeedback("Failed to toggle mic: " + err.message, true);
+      }}
+    }}
+
     function openModal(action, title, desc) {{
       if (!isConnected) return;
       pendingAction = action;
@@ -983,6 +1278,27 @@ class Stream:
     // Startup
     checkStatusDirect();
     initWebSocket();
+
+    async function toggleMic(checkbox) {{
+      const enabled = checkbox.checked;
+      try {{
+        const res = await fetch("/esp/mic", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ enabled: enabled }})
+        }});
+        if (!res.ok) {{
+          showFeedback("Failed to toggle ESP32 microphone", true);
+          checkbox.checked = !enabled;
+          return;
+        }}
+        const data = await res.json();
+        showFeedback(data.mic_enabled ? "ESP32 microphone enabled" : "ESP32 microphone disabled");
+      }} catch (e) {{
+        showFeedback("Error toggling microphone: " + e, true);
+        checkbox.checked = !enabled;
+      }}
+    }}
   </script>
 </body>
 </html>"""
@@ -1086,6 +1402,41 @@ class Stream:
                 await broadcast_esp_status(False)
                 raise HTTPException(status_code=500, detail=f"Failed to deliver command to ESP32: {e}")
 
+        @app.post("/esp/toggle_mic")
+        async def esp_toggle_mic(request: Request):
+            if not self.esp_ws:
+                raise HTTPException(status_code=400, detail="ESP32 is not connected via WebSocket")
+
+            body = await request.json()
+            enabled = bool(body.get("enabled", False))
+            cmd = f"TOGGLE_MIC:{1 if enabled else 0}"
+            try:
+                await self.esp_ws.send_text(cmd)
+                print(f"[Stream Receiver] Sent TOGGLE_MIC:{1 if enabled else 0} to ESP32.")
+                return {"status": "ok", "message": f"ESP32 mic {'enabled' if enabled else 'disabled'}"}
+            except Exception as e:
+                self.esp_ws = None
+                await broadcast_esp_status(False)
+                raise HTTPException(status_code=500, detail=f"Failed to deliver command to ESP32: {e}")
+
+        @app.post("/esp/mic")
+        async def esp_mic_toggle(request: Request):
+            if not self.esp_ws:
+                raise HTTPException(status_code=400, detail="ESP32 is not connected via WebSocket")
+
+            body = await request.json()
+            enabled = bool(body.get("enabled", False))
+
+            try:
+                cmd = f"TOGGLE_MIC:{1 if enabled else 0}"
+                await self.esp_ws.send_text(cmd)
+                print(f"[Stream Receiver] Sent {cmd} to ESP32.")
+                return {"status": "ok", "mic_enabled": enabled}
+            except Exception as e:
+                self.esp_ws = None
+                await broadcast_esp_status(False)
+                raise HTTPException(status_code=500, detail=f"Failed to deliver mic command to ESP32: {e}")
+
         # -------------------------------------------------------------
         # KNOWN FACES MANAGEMENT DASHBOARD (/faces)
         # -------------------------------------------------------------
@@ -1154,6 +1505,15 @@ class Stream:
     #videoEl { width: 100%; height: 100%; object-fit: cover; display: block; }
     #snapCanvas { display: none; }
     #previewImg { width: 100%; border-radius: 12px; margin-bottom: 12px; display: none; }
+    .cam-flip-btn {
+      position: absolute; bottom: 10px; right: 10px; z-index: 10;
+      width: 36px; height: 36px; border-radius: 50%; border: none; cursor: pointer;
+      background: rgba(0,0,0,0.55); color: #fff; font-size: 18px;
+      display: flex; align-items: center; justify-content: center;
+      backdrop-filter: blur(6px); transition: background 0.15s, transform 0.2s;
+    }
+    .cam-flip-btn:hover { background: rgba(59,130,246,0.7); }
+    .cam-flip-btn:active { transform: rotate(180deg); }
 
     /* File drop */
     .drop-zone {
@@ -1250,6 +1610,7 @@ class Stream:
     <div id="tab-webcam" class="tab-pane active">
       <div id="videoWrap">
         <video id="videoEl" autoplay playsinline muted></video>
+        <button id="flipBtn" class="cam-flip-btn" onclick="flipCamera()" title="Switch camera" style="display:none;">🔄</button>
       </div>
       <canvas id="snapCanvas"></canvas>
       <img id="previewImg" alt="Captured photo">
@@ -1303,6 +1664,7 @@ class Stream:
     let capturedBlob = null;   // Blob from webcam snapshot
     let fileBlob     = null;   // Blob from file picker
     let pendingDeleteId = null;
+    let facingMode   = 'user'; // 'user' = front, 'environment' = back
 
     // ── Tab switching ──────────────────────────────────────────────────
     function switchTab(name, btn) {
@@ -1315,18 +1677,37 @@ class Stream:
     }
 
     // ── Webcam ─────────────────────────────────────────────────────────
-    async function startCamera() {
+    async function startCamera(facing) {
+      if (facing) facingMode = facing;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+        // Stop any existing stream first
+        if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: facingMode },
+          audio: false
+        });
         const vid = document.getElementById('videoEl');
         vid.srcObject = stream;
         document.getElementById('camBtn').disabled  = true;
         document.getElementById('snapBtn').disabled = false;
         document.getElementById('previewImg').style.display = 'none';
         document.getElementById('videoWrap').style.display  = 'block';
+
+        // Show flip button only when camera is live; check if device has multiple cameras
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoCams = devices.filter(d => d.kind === 'videoinput');
+        const flipBtn = document.getElementById('flipBtn');
+        flipBtn.style.display = videoCams.length > 1 ? 'flex' : 'none';
+        flipBtn.title = facingMode === 'user' ? 'Switch to back camera' : 'Switch to front camera';
       } catch (e) {
         showFeedback('Camera access denied: ' + e.message, true);
       }
+    }
+
+    async function flipCamera() {
+      facingMode = facingMode === 'user' ? 'environment' : 'user';
+      await startCamera(facingMode);
     }
 
     function stopCamera() {
@@ -1335,6 +1716,7 @@ class Stream:
       vid.srcObject = null;
       document.getElementById('camBtn').disabled  = false;
       document.getElementById('snapBtn').disabled = true;
+      document.getElementById('flipBtn').style.display = 'none';
     }
 
     function snapPhoto() {
@@ -1363,7 +1745,7 @@ class Stream:
       document.getElementById('snapBtn').style.display    = 'flex';
       document.getElementById('retakeBtn').style.display  = 'none';
       document.getElementById('submitWebcamBtn').disabled = true;
-      startCamera();
+      startCamera(); // re-uses last facingMode
     }
 
     function clearCapture() {

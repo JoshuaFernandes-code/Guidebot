@@ -14,9 +14,13 @@ class VoiceInput:
         self.command_queue = queue.Queue()
         self.running = True
         self.use_web_mic = CONFIG.get("use_web_mic", False)
+        self.use_esp32_mic = CONFIG.get("use_esp32_mic", False)
 
         if self.use_web_mic:
             print("[Voice] USE_WEB_MIC=true: Local microphone disabled. Commands accepted via Web UI at /audio.")
+            self.thread = None
+        elif self.use_esp32_mic:
+            print("[Voice] USE_ESP32_MIC=true: Local microphone disabled. Commands stream from the ESP32-S3 I2S mic (via /ws/stream AUDIO_DATA).")
             self.thread = None
         else:
             try:

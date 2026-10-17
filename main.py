@@ -10,6 +10,7 @@ from pipeline.ocr import OCRReader
 from pipeline.face import FaceRecognizer
 from audio.tts import TTS
 from audio.voice_input import VoiceInput
+from audio.llm import LLMAssistant
 from config import CONFIG
 
 
@@ -157,16 +158,25 @@ def main():
     # Pass face_recognizer so /faces API can hot-reload embeddings after add/delete
     stream          = Stream(voice_input=voice_input, face_recognizer=face_recognizer)
 
+    # Wire TTS → Stream: broadcast spoken text to /ws/tts-feed web clients
+    tts.set_broadcast(stream.broadcast_tts_text)
+
+    # Local LLM Assistant (Ollama)
+    llm = LLMAssistant(
+        ollama_url=CONFIG.get("llm_url", "http://127.0.0.1:11434"),
+        model=CONFIG.get("llm_model", "llama3.2:3b"),
+        enabled=CONFIG.get("llm_enabled", True),
+        auto_start=CONFIG.get("llm_auto_start", True),
+        tts_callback=tts.speak,
+    )
+
     inference = InferencePipeline(stream, detector, depth_estimator, decision_engine)
 
     cv2.namedWindow("GuideBot", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("GuideBot", CONFIG["display_width"], CONFIG["display_height"])
 
-    prev_time           = time.time()
     last_fps_update     = 0.0
-    display_fps_text    = "0.0"
     inf_fps_text        = "0.0"
-    smooth_display_fps  = 0.0
     frame_width         = CONFIG["display_width"]
     frame_height        = CONFIG["display_height"]
 
@@ -178,6 +188,13 @@ def main():
             if not stream.is_alive(timeout=3.0):
                 standby = draw_standby_screen(frame_width, frame_height, stream)
                 cv2.imshow("GuideBot", standby)
+                
+                # Still process voice commands even when video stream is in standby
+                cmd_standby = voice_input.get_command()
+                if cmd_standby:
+                    print(f"[Voice / LLM (Standby)] User asked: '{cmd_standby}'")
+                    llm.ask(cmd_standby)
+
                 key = cv2.waitKey(30)
                 if (key & 0xFF == ord('q')) or is_window_closed("GuideBot"):
                     break
@@ -191,6 +208,12 @@ def main():
             if annotated_frame is None or annotated_frame.size == 0:
                 standby = draw_standby_screen(frame_width, frame_height, stream)
                 cv2.imshow("GuideBot", standby)
+
+                cmd_standby = voice_input.get_command()
+                if cmd_standby:
+                    print(f"[Voice / LLM (Standby)] User asked: '{cmd_standby}'")
+                    llm.ask(cmd_standby)
+
                 key = cv2.waitKey(30)
                 if (key & 0xFF == ord('q')) or is_window_closed("GuideBot"):
                     break
@@ -212,67 +235,96 @@ def main():
             # ------------------------------------------------------------------
             # Audio / Decision engine (non-blocking: uses last known detections)
             # ------------------------------------------------------------------
+            llm.update_detections(detections)
+
             messages = decision_engine.decide(detections)
             for message in messages:
                 print(f"[GuideBot Speaking] {message}")
                 tts.speak(message)
+                llm.update_tts_history(message)
 
             command = voice_input.get_command()
             if command:
+                cmd_clean = command.strip().lower()
+                # Remove common trailing punctuation
+                cmd_clean = cmd_clean.rstrip(".?!,")
+                words = cmd_clean.split()
+                num_words = len(words)
+
+                # Intent Classification:
+                # 1. Fast Direct Navigation Queries (exact phrases or short commands <= 4 words)
+                DIRECT_AHEAD = {
+                    "ahead", "front", "forward", "what is ahead", "what's ahead",
+                    "whats ahead", "what is in front", "whats in front",
+                    "what is in front of me", "anything ahead", "anything in front"
+                }
+                DIRECT_LEFT = {
+                    "left", "what is on my left", "what's on my left", "whats on my left",
+                    "what is left", "whats left", "anything on my left"
+                }
+                DIRECT_RIGHT = {
+                    "right", "what is on my right", "what's on my right", "whats on my right",
+                    "what is right", "whats right", "anything on my right"
+                }
+
                 query = None
-                if any(w in command for w in ["ahead", "front", "forward", "head"]):
+                if cmd_clean in DIRECT_AHEAD or (num_words <= 3 and any(w in words for w in ["ahead", "forward"])):
                     query = "ahead"
-                elif "left" in command:
+                elif cmd_clean in DIRECT_LEFT or (num_words <= 4 and "left" in words and any(w in words for w in ["what", "whats", "what's", "is", "on", "check"])):
                     query = "left"
-                elif "right" in command:
+                elif cmd_clean in DIRECT_RIGHT or (num_words <= 4 and "right" in words and any(w in words for w in ["what", "whats", "what's", "is", "on", "check"])):
                     query = "right"
+
+                # 2. Fast OCR Queries
+                is_ocr_query = (
+                    cmd_clean in {"read", "read text", "read this", "read sign", "read sign board", "read the text"} or
+                    (num_words <= 3 and "read" in words)
+                )
+
+                # 3. Fast Face Identification Queries
+                is_face_query = (
+                    cmd_clean in {"who", "who is this", "who is that", "who is here", "who are you looking at", "identify face", "who is in front"} or
+                    (num_words <= 4 and "who" in words and any(w in words for w in ["this", "that", "here", "is"]))
+                )
 
                 if query:
                     response = decision_engine.answer_query(query, detections, frame_width)
                     print(f"[GuideBot Speaking] {response}")
                     tts.speak(response)
-                elif "read" in command:
+                    llm.update_tts_history(response)
+                elif is_ocr_query:
                     print("[OCR] Reading current frame...")
                     text_result = ocr_reader.read_frame(annotated_frame)
                     print(f"[GuideBot Speaking] {text_result}")
                     tts.speak(text_result)
-                elif "who" in command:
+                    llm.update_tts_history(text_result)
+                    llm.update_ocr(text_result)
+                elif is_face_query:
                     print("[Face] Identifying...")
                     face_result = face_recognizer.identify(annotated_frame)
                     print(f"[GuideBot Speaking] {face_result}")
                     tts.speak(face_result)
+                    llm.update_tts_history(face_result)
+                    llm.update_face(face_result)
                 else:
-                    print(f"[Voice] Command not recognized: '{command}'")
+                    # 4. Conversational / Feedback / Contextual statement -> Route to Local LLM Assistant
+                    print(f"[Voice / LLM] Conversational query routed to assistant: '{command}'")
+                    llm.ask(command)
 
             # ------------------------------------------------------------------
-            # FPS Overlay: Smoothed & Fixed Positions (No Jitter)
+            # FPS Overlay: Inference FPS Badge
             # ------------------------------------------------------------------
             curr_time = time.time()
-            instant_display_fps = 1.0 / max(curr_time - prev_time, 1e-6)
-            prev_time = curr_time
-
-            # Exponential moving average to eliminate micro-fluctuations
-            if smooth_display_fps == 0.0:
-                smooth_display_fps = instant_display_fps
-            else:
-                smooth_display_fps = 0.85 * smooth_display_fps + 0.15 * instant_display_fps
-
-            # Refresh the displayed text strings every 300ms so numbers don't flicker
             if curr_time - last_fps_update >= 0.3:
-                display_fps_text = f"{smooth_display_fps:.1f}"
                 inf_fps_text = f"{inf_fps:.1f}"
                 last_fps_update = curr_time
 
             # Draw dark background badge for contrast
-            cv2.rectangle(annotated_frame, (8, 6), (420, 38), (20, 20, 20), -1)
-            cv2.rectangle(annotated_frame, (8, 6), (420, 38), (80, 80, 80), 1)
+            cv2.rectangle(annotated_frame, (8, 6), (185, 38), (20, 20, 20), -1)
+            cv2.rectangle(annotated_frame, (8, 6), (185, 38), (80, 80, 80), 1)
 
-            # Draw Display at x=15 and Inference at fixed x=220
-            # Because x=220 is independent, Inference will NEVER shift left or right!
-            cv2.putText(annotated_frame, f"Display: {display_fps_text} fps",
+            cv2.putText(annotated_frame, f"Inference: {inf_fps_text} fps",
                         (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.putText(annotated_frame, f"| Inference: {inf_fps_text} fps",
-                        (220, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             if annotated_frame is not None and getattr(annotated_frame, "size", 0) > 0 and len(annotated_frame.shape) == 3 and annotated_frame.shape[0] > 0 and annotated_frame.shape[1] > 0:
                 cv2.imshow("GuideBot", annotated_frame)

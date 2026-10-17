@@ -24,7 +24,7 @@ CONFIG = {
 
     # Object Detection Settings
     "yolo_model": "yolov8n.pt",
-    "confidence_threshold": 0.65,
+    "confidence_threshold": float(os.getenv("CONFIDENCE_THRESHOLD", "0.45")),
     "detection_classes": None,
 
     # Depth Estimation Settings
@@ -38,6 +38,10 @@ CONFIG = {
 
     # Voice Command Settings
     "use_web_mic": os.getenv("USE_WEB_MIC", "false").strip().lower() in ("1", "true", "yes"),
+    "use_esp32_mic": os.getenv("USE_ESP32_MIC", "false").strip().lower() in ("1", "true", "yes"),
+    "esp32_mic_sample_rate": int(os.getenv("ESP32_MIC_SAMPLE_RATE", "16000")),
+    "esp32_mic_channels": 1,
+    "esp32_mic_vad_threshold": float(os.getenv("ESP32_MIC_VAD_THRESHOLD", "0.005")),
     "whisper_model": "base",
     "voice_sample_rate": 16000,
     "voice_record_seconds": 3,
@@ -49,4 +53,11 @@ CONFIG = {
 
     # Face Recognition Settings
     "face_similarity_threshold": 0.5,
+
+    # Local LLM Assistant Settings (Ollama)
+    "llm_enabled": os.getenv("LLM_ENABLED", "true").strip().lower() in ("1", "true", "yes"),
+    "llm_auto_start": os.getenv("LLM_AUTO_START", "true").strip().lower() in ("1", "true", "yes"),
+    "llm_model": os.getenv("LLM_MODEL", "llama3.2:3b"),
+    "llm_url": os.getenv("LLM_URL", "http://127.0.0.1:11434"),
+    "llm_timeout": float(os.getenv("LLM_TIMEOUT", "25.0")),
 }

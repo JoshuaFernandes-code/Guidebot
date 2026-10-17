@@ -9,3 +9,7 @@ data/currency_model/
 secrets.h
 esp32/**/secrets.h
 context.md
+graphify-out
+.gemini
+.qodo
+scratch

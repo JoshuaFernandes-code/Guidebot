@@ -14,6 +14,9 @@
 #include <DNSServer.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <math.h>
+#include <ESP_I2S.h>
+#include "mbedtls/base64.h"
 
 #if USE_WEBSOCKET
   #include <WebSocketsClient.h>
@@ -40,6 +43,22 @@
 // Target frame rate interval in ms (66ms = ~15 FPS target)
 #define FRAME_INTERVAL_MS 66
 
+// ============================================================================
+// MICROPHONE CONFIG (XIAO ESP32-S3 Sense onboard PDM mic, MSM261D3526H1CPM)
+// The Sense expansion-board mic is a DIGITAL PDM mic wired to GPIO42 (CLK)
+// and GPIO41 (DATA) — there is no WS/LRCK line in PDM mode. Verified against
+// the Seeed schematic (wiki: "Microphone Usage for Sense Version").
+// ============================================================================
+#define I2S_MIC_ENABLED true          // Set false to exclude I2S mic code from build
+#define I2S_MIC_CLK_GPIO    42        // PDM clock pin (Sense onboard mic)
+#define I2S_MIC_DATA_GPIO   41        // PDM data pin (Sense onboard mic)
+#define I2S_MIC_SAMPLE_RATE 16000     // Must match Whisper input (16 kHz mono)
+#define I2S_MIC_VAD_THRESHOLD 0       // On-device RMS gate (0-32767). 0 = always
+                                      // stream audio; utterance segmentation happens
+                                      // server-side so no speech is ever lost and
+                                      // silence keeps the server's flush timer alive.
+#define I2S_MIC_READ_MS     100       // Milliseconds of audio to capture per WebSocket send
+
 // Hotspot SSID for initial setup (open, no password required)
 #define AP_SSID "GuideBot-Setup"
 
@@ -54,6 +73,7 @@ String config_auth_token;
 int    config_wifi_auth_mode = -1;
 
 bool   config_is_configured = false;
+bool   config_mic_enabled   = false;   // Stored in Preferences; toggled from dashboard
 
 Preferences prefs;
 DNSServer dnsServer;
@@ -214,6 +234,7 @@ void loadConfiguration() {
         config_server_port = prefs.getInt("port", DEFAULT_SERVER_PORT);
         config_auth_token  = prefs.getString("token", DEFAULT_AUTH_TOKEN);
         config_wifi_auth_mode = prefs.getInt("wifi_auth", -1);
+        config_mic_enabled  = prefs.getBool("mic_enabled", false);
     } else {
         // Unconfigured or reset: clear runtime Wi-Fi so board does not attempt auto-join
         config_ssid        = "";
@@ -222,6 +243,7 @@ void loadConfiguration() {
         config_server_port = prefs.getInt("port", DEFAULT_SERVER_PORT);
         config_auth_token  = prefs.getString("token", DEFAULT_AUTH_TOKEN);
         config_wifi_auth_mode = -1;
+        config_mic_enabled = false;
     }
     prefs.end();
 
@@ -232,6 +254,7 @@ void loadConfiguration() {
     Serial.printf("         SSID:        %s\n", config_ssid.length() > 0 ? config_ssid.c_str() : "(none)");
     Serial.printf("         Server Host: %s:%d\n", config_server_host.c_str(), config_server_port);
     Serial.printf("         Auth Token:  %s\n", config_auth_token.length() > 0 ? "***" : "none");
+    Serial.printf("         Mic Enabled: %s\n", config_mic_enabled ? "YES" : "NO");
 }
 
 void saveConfiguration(const String& new_ssid, const String& new_pass, const String& new_host, const String& new_token, int new_auth_mode = -1) {
@@ -252,6 +275,7 @@ void saveConfiguration(const String& new_ssid, const String& new_pass, const Str
     prefs.putInt("port", config_server_port);
     prefs.putString("token", config_auth_token);
     prefs.putInt("wifi_auth", config_wifi_auth_mode);
+    prefs.putBool("mic_enabled", config_mic_enabled);
     prefs.end();
     Serial.println("[Config] Successfully saved new credentials to flash.");
 }
@@ -272,6 +296,7 @@ void performClearCredentials() {
     config_ssid          = "";
     config_password      = "";
     config_wifi_auth_mode = -1;
+    config_mic_enabled   = false;
     Serial.println("[Config] Stored Wi-Fi erased & hardware cache wiped successfully.");
 }
 
@@ -341,6 +366,20 @@ void checkAdaptiveResolution() {
 }
 
 // ============================================================================
+// I2S MICROPHONE STATE
+// Declared before the PROTOCOL IMPLEMENTATION section because webSocketEvent()
+// references these in its TOGGLE_MIC handler. (Arduino only auto-generates
+// function prototypes, not variable declarations.)
+// ============================================================================
+#if I2S_MIC_ENABLED
+I2SClass I2S;
+unsigned long last_mic_send_ms = 0;
+bool i2s_mic_initialized = false;
+bool initMicrophone();
+void captureAndSendAudio();
+#endif
+
+// ============================================================================
 // PROTOCOL IMPLEMENTATION (WebSocket / HTTP)
 // ============================================================================
 #if USE_WEBSOCKET
@@ -374,6 +413,19 @@ void checkAdaptiveResolution() {
                   if (force_high_res) {
                       setResolution(FRAMESIZE_VGA);
                   }
+              } else if (msg.startsWith("TOGGLE_MIC:")) {
+                  bool new_state = msg.substring(11).toInt() == 1;
+                  config_mic_enabled = new_state;
+                  Serial.printf("[I2S Mic] Mic %s via remote command\n",
+                                config_mic_enabled ? "ENABLED" : "DISABLED");
+  #if I2S_MIC_ENABLED
+                  if (config_mic_enabled && !i2s_mic_initialized) {
+                      initMicrophone();
+                  }
+  #endif
+                  // Persist mic setting to flash so it survives reboot
+                  saveConfiguration(config_ssid, config_password, config_server_host,
+                                    config_auth_token, config_wifi_auth_mode);
               } else if (msg == "SCAN_WIFI" || msg.startsWith("SCAN_WIFI")) {
                   flag_scan_wifi = true;
               } else if (msg.startsWith("SET_WIFI:")) {
@@ -416,6 +468,119 @@ void checkAdaptiveResolution() {
           Serial.println("[WS] Frame send FAILED (buffer full or network lag)");
       }
   }
+
+  // ============================================================================
+  // I2S MICROPHONE
+  // ============================================================================
+  #if I2S_MIC_ENABLED
+
+  #define MIC_CHUNK_SAMPLES 512
+  #define MIC_TARGET_SAMPLES 1536  // ~96 ms @ 16 kHz
+
+  bool initMicrophone() {
+      if (i2s_mic_initialized) {
+          Serial.println("[I2S Mic] Microphone already initialized.");
+          return true;
+      }
+      Serial.println("\n[I2S Mic] Initializing I2S microphone (Seeed XIAO ESP32S3 Sense) via ESP_I2S...");
+
+      // Configure PDM receiver pins for the XIAO ESP32S3 Sense microphone:
+      // CLK = GPIO42 (D11 pad on Sense expansion board)
+      // DIN = GPIO41 (D12 pad on Sense expansion board)
+      I2S.setPinsPdmRx(I2S_MIC_CLK_GPIO, I2S_MIC_DATA_GPIO);
+      I2S.setTimeout(50); // 50ms read timeout so audio capture never blocks video stream
+
+      // Initialize I2S in PDM receiver mono mode at 16 kHz 16-bit
+      if (!I2S.begin(I2S_MODE_PDM_RX, I2S_MIC_SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+          Serial.println("[I2S Mic] ERROR: I2S.begin(I2S_MODE_PDM_RX) failed!");
+          return false;
+      }
+
+      Serial.printf("[I2S Mic] Initialized and started successfully (CLK=GPIO%d, DATA=GPIO%d, 16kHz Mono)\n",
+                    I2S_MIC_CLK_GPIO, I2S_MIC_DATA_GPIO);
+      i2s_mic_initialized = true;
+      return true;
+  }
+
+  void captureAndSendAudio() {
+      if (!config_mic_enabled || !is_connected || !i2s_mic_initialized) return;
+
+      static int16_t accumulated_pcm[MIC_TARGET_SAMPLES];
+      static int accumulated_count = 0;
+      static char tx_buf[6144];
+      static unsigned long last_warn_ms = 0;
+      static unsigned long last_debug_ms = 0;
+      unsigned long now = millis();
+
+      int16_t read_chunk[MIC_CHUNK_SAMPLES];
+      size_t bytes_read = I2S.readBytes((char *)read_chunk, sizeof(read_chunk));
+      int samples_read = bytes_read / sizeof(int16_t);
+
+      if (samples_read == 0) {
+          if (now - last_warn_ms >= 3000) {
+              last_warn_ms = now;
+              Serial.printf("[I2S Mic] Warning: readBytes returned 0 bytes (lastError=0x%x)\n", I2S.lastError());
+          }
+          return;
+      }
+
+      // Copy into accumulation buffer
+      int to_copy = samples_read;
+      if (accumulated_count + to_copy > MIC_TARGET_SAMPLES) {
+          to_copy = MIC_TARGET_SAMPLES - accumulated_count;
+      }
+      memcpy(&accumulated_pcm[accumulated_count], read_chunk, to_copy * sizeof(int16_t));
+      accumulated_count += to_copy;
+
+      // Only process & send when ~100ms (1536 samples) is ready
+      if (accumulated_count < MIC_TARGET_SAMPLES) {
+          return;
+      }
+
+      // VAD: compute RMS of raw int16 samples (64-bit sum to avoid 32-bit overflow)
+      long long sum_sq = 0;
+      for (int i = 0; i < accumulated_count; i++) {
+          sum_sq += (long long)accumulated_pcm[i] * (long long)accumulated_pcm[i];
+      }
+      double rms = sqrt((double)sum_sq / (double)accumulated_count);
+
+      // Throttled diagnostic: prove audio is flowing and show RMS for tuning
+      if (now - last_debug_ms >= 2000) {
+          last_debug_ms = now;
+          Serial.printf("[I2S Mic] Audio flowing: samples=%d, RMS=%.1f (VAD threshold=%d)\n",
+                        accumulated_count, rms, I2S_MIC_VAD_THRESHOLD);
+      }
+
+      if (rms >= I2S_MIC_VAD_THRESHOLD) {
+          size_t raw_len = accumulated_count * sizeof(int16_t);
+          size_t out_len = 0;
+          const char prefix[] = "AUDIO_DATA:";
+          const size_t prefix_len = 11;
+          memcpy(tx_buf, prefix, prefix_len);
+
+          int b64_err = mbedtls_base64_encode(
+              (unsigned char *)(tx_buf + prefix_len),
+              sizeof(tx_buf) - prefix_len - 1,
+              &out_len,
+              (const unsigned char *)accumulated_pcm,
+              raw_len
+          );
+
+          if (b64_err != 0) {
+              Serial.printf("[I2S Mic] Base64 encode error: -0x%04x\n", -b64_err);
+          } else {
+              size_t total_payload_len = prefix_len + out_len;
+              tx_buf[total_payload_len] = '\0';
+              bool ok = webSocket.sendTXT((uint8_t *)tx_buf, total_payload_len);
+              if (!ok) {
+                  Serial.println("[I2S Mic] Audio send FAILED (WS full/lag)");
+              }
+          }
+      }
+
+      accumulated_count = 0;
+  }
+  #endif // I2S_MIC_ENABLED
 
 #else
   WiFiClientSecure client;
@@ -966,6 +1131,15 @@ void setup() {
 
     setupStreaming();
 
+    // Initialize I2S microphone if enabled in saved config
+    #if I2S_MIC_ENABLED
+    if (config_mic_enabled) {
+        if (!initMicrophone()) {
+            Serial.println("[I2S Mic] Warning: microphone init failed; mic audio disabled.");
+        }
+    }
+    #endif
+
     adaptive_window_ms   = millis();
     adaptive_frame_count = 0;
     last_roam_scan_ms = millis();
@@ -1156,6 +1330,10 @@ void loop() {
         }
         esp_camera_fb_return(fb);
     }
+
+#if I2S_MIC_ENABLED
+    captureAndSendAudio();
+#endif
 
     delay(2);
 }
