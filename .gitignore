@@ -5,3 +5,11 @@ models/
 data/known_faces/
 data/currency_model/
 .vscode/
+.env
+secrets.h
+esp32/**/secrets.h
+context.md
+graphify-out
+.gemini
+.qodo
+scratch
