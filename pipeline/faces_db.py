@@ -195,6 +195,35 @@ def delete_face(face_id: int, delete_file: bool = True) -> bool:
     return True
 
 
+def update_face_name(face_id: int, new_display_name: str) -> bool:
+    """Update the display_name of a face record.
+
+    The filename on disk is NOT changed; only the human-readable display
+    label is updated in the DB. The recogniser reads display_name via
+    get_name_map(), so hot-reload picks up the change immediately.
+
+    Returns True if a record was found and updated, False if not found.
+    """
+    if not new_display_name or not new_display_name.strip():
+        raise ValueError("display_name must not be empty")
+
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT id FROM faces WHERE id = ?", (face_id,)
+        ).fetchone()
+        if row is None:
+            return False
+
+        conn.execute(
+            "UPDATE faces SET display_name = ? WHERE id = ?",
+            (new_display_name.strip(), face_id),
+        )
+        conn.commit()
+
+    return True
+
+
 def get_name_map() -> dict[str, str]:
     """Return {filename: display_name} for all registered faces.
 

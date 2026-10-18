@@ -6,14 +6,16 @@ import asyncio
 import os
 import base64
 import queue
+import secrets
+from datetime import datetime, timedelta, timezone
 import numpy as np
 from config import CONFIG
-from pipeline import faces_db
+from pipeline import faces_db, emails_db
 
 try:
     import uvicorn
     from fastapi import BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect, Request, Response, HTTPException, status
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 except ImportError:
     uvicorn = None
     FastAPI = None
@@ -58,6 +60,10 @@ class Stream:
         self._tts_loop = None  # asyncio event loop, captured at first /ws/tts-feed connect
 
         self.auth_token = CONFIG.get("stream_auth_token", "")
+        # Dashboard session store: {token: {"email": str, "expires_at": datetime}}
+        self.sessions: dict = {}
+        self.session_timeout = timedelta(hours=24)
+        self._sessions_lock = threading.Lock()
         self.host = CONFIG.get("receiver_host", "0.0.0.0")
         self.port = int(CONFIG.get("receiver_port", 8000))
         self.url = CONFIG.get("stream_url", "http://10.254.76.220/stream")
@@ -79,6 +85,92 @@ class Stream:
         if not self.auth_token:
             return True
         return provided_token == self.auth_token
+
+    # -------------------------------------------------------------
+    # DASHBOARD SESSION MANAGEMENT
+    # -------------------------------------------------------------
+    def _create_session(self, email: str) -> str:
+        """Create a new session token for the given email. Returns the token string."""
+        token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(timezone.utc) + self.session_timeout
+        pw_ts = emails_db.get_password_updated_at(email) or ""
+        with self._sessions_lock:
+            self.sessions[token] = {"email": email, "expires_at": expires_at, "pw_ts": pw_ts}
+        # Clean up expired sessions
+        self._purge_expired_sessions()
+        return token
+
+    def _validate_session(self, token: str | None) -> str | None:
+        """Validate a session token. Returns the email if valid, None otherwise."""
+        if not token:
+            return None
+        with self._sessions_lock:
+            session = self.sessions.get(token)
+            if session is None:
+                return None
+            if datetime.now(timezone.utc) > session["expires_at"]:
+                del self.sessions[token]
+                return None
+            email = session["email"]
+            # Drop sessions created before THAT user's last password change.
+            if (session.get("pw_ts") or "") != (emails_db.get_password_updated_at(email) or ""):
+                del self.sessions[token]
+                return None
+            return email
+
+    def _clear_session(self, token: str | None) -> None:
+        """Remove a session token."""
+        if token:
+            with self._sessions_lock:
+                self.sessions.pop(token, None)
+
+    def _purge_expired_sessions(self) -> None:
+        """Remove all expired sessions (caller must hold _sessions_lock)."""
+        now = datetime.now(timezone.utc)
+        expired = [t for t, s in self.sessions.items() if now > s["expires_at"]]
+        for t in expired:
+            del self.sessions[t]
+
+    def _require_dashboard_auth(self, request: Request) -> str | None:
+        """Check dashboard authentication.
+
+        Returns the authenticated email if valid, or None if no allowed emails
+        are registered (dashboard is open). Raises HTTPException(401) if
+        unauthenticated and auth is required.
+        """
+        if not emails_db.list_emails():
+            # No allowed emails registered — dashboard is open
+            return None
+
+        token = request.cookies.get("guidebot_session")
+        email = self._validate_session(token)
+        if email is None or not emails_db.is_allowed(email):
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return email
+
+    def _require_dashboard_auth_html(self, request: Request) -> str | RedirectResponse | None:
+        """Like _require_dashboard_auth but redirects to /login for HTML clients.
+
+        Returns:
+            str: authenticated email if valid
+            None: if no allowed emails are registered (dashboard is open)
+            RedirectResponse: if unauthenticated, redirect to /login
+        """
+        if not emails_db.list_emails():
+            return None
+
+        token = request.cookies.get("guidebot_session")
+        email = self._validate_session(token)
+        if email is not None and emails_db.is_allowed(email):
+            return email
+
+        # Redirect to login with the original path as 'next'
+        next_url = request.url.path
+        return RedirectResponse(url=f"/login?next={next_url}", status_code=307)
 
     def _reload_faces(self):
         """Refresh face embeddings without holding up a dashboard request."""
@@ -259,6 +351,7 @@ class Stream:
             for tid, path, label in tabs:
                 cls = "app-tab active" if tid == active_tab else "app-tab"
                 links.append(f'<a href="{path}" class="{cls}">{label}</a>')
+            links.append('<a href="#" class="app-tab" onclick="fetch(\'/logout\', {method: \'POST\'}).then(() => window.location.href = \'/login\'); return false;" title="Sign out">🚪 Logout</a>')
             return f'<nav class="app-nav-bar">{"".join(links)}</nav>'
 
         @app.get("/")
@@ -266,9 +359,13 @@ class Stream:
             accept = request.headers.get("accept", "")
             # If request is from browser requesting HTML, render portal page
             if "text/html" in accept:
-                pass  # Fall through to HTML rendering below
+                # Dashboard auth guard (HTML clients redirect to /login)
+                auth = self._require_dashboard_auth_html(request)
+                if isinstance(auth, RedirectResponse):
+                    return auth
             else:
-                return health()
+                # JSON health probe — health() applies the auth guard itself
+                return health(request)
 
             use_web_mic = CONFIG.get("use_web_mic", False)
             audio_link = '<a href="/audio" class="nav-card">🎤<span>Voice Input</span><small>Web Audio recording</small></a>' if use_web_mic else \
@@ -334,7 +431,9 @@ class Stream:
             return HTMLResponse(content=html)
 
         @app.get("/health")
-        def health():
+        def health(request: Request):
+            # Dashboard auth guard (JSON API)
+            self._require_dashboard_auth(request)
             with self.lock:
                 has_frame = self.latest_frame is not None
                 last_seen = round(time.time() - self.latest_timestamp, 2) if has_frame else None
@@ -392,6 +491,14 @@ class Stream:
 
         @app.websocket("/ws/tts-feed")
         async def tts_feed(websocket: WebSocket):
+            # Dashboard auth guard (cookie session) when login is active
+            if emails_db.list_emails():
+                token = websocket.cookies.get("guidebot_session")
+                email = self._validate_session(token)
+                if email is None or not emails_db.is_allowed(email):
+                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                    return
+
             await websocket.accept()
             self._tts_loop = asyncio.get_running_loop()
             self.tts_clients.add(websocket)
@@ -497,7 +604,12 @@ class Stream:
             import tempfile
 
             @app.get("/audio", response_class=HTMLResponse)
-            def audio_control_panel():
+            def audio_control_panel(request: Request):
+                # Dashboard auth guard
+                auth = self._require_dashboard_auth_html(request)
+                if isinstance(auth, RedirectResponse):
+                    return auth
+
                 nav_html = render_nav_tabs("audio")
                 html = """<!DOCTYPE html>
 <html lang="en">
@@ -823,6 +935,8 @@ class Stream:
 
             @app.post("/audio/command")
             async def submit_audio_command(request: Request):
+                # Dashboard auth guard (JSON API)
+                self._require_dashboard_auth(request)
                 body = await request.json()
                 command = body.get("command", "").strip()
                 if not command:
@@ -833,6 +947,8 @@ class Stream:
 
             @app.post("/audio/upload")
             async def upload_audio_recording(request: Request):
+                # Dashboard auth guard (JSON API)
+                self._require_dashboard_auth(request)
                 if not self.voice_input:
                     raise HTTPException(status_code=500, detail="Voice input not initialized")
 
@@ -855,7 +971,14 @@ class Stream:
         # ESP MANAGEMENT & REMOTE CONTROL DASHBOARD (/esp)
         # -------------------------------------------------------------
         @app.get("/esp", response_class=HTMLResponse)
-        def esp_control_panel():
+        def esp_control_panel(request: Request):
+            # Dashboard auth guard (HTML clients redirect to /login).
+            # NOTE: the ESP transport itself (/frame, /ws/stream) stays
+            # STREAM_AUTH_TOKEN-only so the ESP32 (which has no dashboard
+            # session) keeps working.
+            auth = self._require_dashboard_auth_html(request)
+            if isinstance(auth, RedirectResponse):
+                return auth
             current_ssid = self.esp_current_ssid or ""
             nav_html = render_nav_tabs("esp")
             html = f"""<!DOCTYPE html>
@@ -1359,12 +1482,23 @@ class Stream:
             return HTMLResponse(content=html)
 
         @app.get("/esp/status")
-        def esp_status():
+        def esp_status(request: Request):
+            # Dashboard auth guard (JSON API). Only the raw ESP transport
+            # (/frame, /ws/stream) stays STREAM_AUTH_TOKEN-only.
+            self._require_dashboard_auth(request)
             connected = self.esp_ws is not None
             return {"status": "ok", "connected": connected}
 
         @app.websocket("/ws/esp-status")
         async def websocket_esp_status(websocket: WebSocket):
+            # Dashboard socket — requires a valid login session when active.
+            # (Distinct from /ws/stream, which is the ESP's STREAM_AUTH_TOKEN channel.)
+            if emails_db.list_emails():
+                token = websocket.cookies.get("guidebot_session")
+                email = self._validate_session(token)
+                if email is None or not emails_db.is_allowed(email):
+                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                    return
             await websocket.accept()
             self.dash_clients.add(websocket)
             # Immediately send initial state
@@ -1381,7 +1515,9 @@ class Stream:
                 self.dash_clients.discard(websocket)
 
         @app.post("/esp/scan")
-        async def esp_scan():
+        async def esp_scan(request: Request):
+            # Dashboard auth guard (JSON API)
+            self._require_dashboard_auth(request)
             if not self.esp_ws:
                 raise HTTPException(status_code=400, detail="ESP32 is not connected via WebSocket")
 
@@ -1407,6 +1543,8 @@ class Stream:
 
         @app.post("/esp/wifi")
         async def esp_switch_wifi(request: Request):
+            # Dashboard auth guard (JSON API)
+            self._require_dashboard_auth(request)
             if not self.esp_ws:
                 raise HTTPException(status_code=400, detail="ESP32 is not connected via WebSocket")
 
@@ -1429,7 +1567,9 @@ class Stream:
                 raise HTTPException(status_code=500, detail=f"Failed to deliver command to ESP32: {e}")
 
         @app.post("/esp/reboot")
-        async def esp_reboot():
+        async def esp_reboot(request: Request):
+            # Dashboard auth guard (JSON API)
+            self._require_dashboard_auth(request)
             if not self.esp_ws:
                 raise HTTPException(status_code=400, detail="ESP32 is not connected via WebSocket")
 
@@ -1443,7 +1583,9 @@ class Stream:
                 raise HTTPException(status_code=500, detail=f"Failed to deliver command to ESP32: {e}")
 
         @app.post("/esp/erase")
-        async def esp_erase():
+        async def esp_erase(request: Request):
+            # Dashboard auth guard (JSON API)
+            self._require_dashboard_auth(request)
             if not self.esp_ws:
                 raise HTTPException(status_code=400, detail="ESP32 is not connected via WebSocket")
 
@@ -1458,6 +1600,8 @@ class Stream:
 
         @app.post("/esp/toggle_mic")
         async def esp_toggle_mic(request: Request):
+            # Dashboard auth guard (JSON API)
+            self._require_dashboard_auth(request)
             if not self.esp_ws:
                 raise HTTPException(status_code=400, detail="ESP32 is not connected via WebSocket")
 
@@ -1475,6 +1619,8 @@ class Stream:
 
         @app.post("/esp/mic")
         async def esp_mic_toggle(request: Request):
+            # Dashboard auth guard (JSON API)
+            self._require_dashboard_auth(request)
             if not self.esp_ws:
                 raise HTTPException(status_code=400, detail="ESP32 is not connected via WebSocket")
 
@@ -1495,7 +1641,12 @@ class Stream:
         # KNOWN FACES MANAGEMENT DASHBOARD (/faces)
         # -------------------------------------------------------------
         @app.get("/faces", response_class=HTMLResponse)
-        def faces_panel():
+        def faces_panel(request: Request):
+            # Dashboard auth guard
+            auth = self._require_dashboard_auth_html(request)
+            if isinstance(auth, RedirectResponse):
+                return auth
+
             nav_html = render_nav_tabs("faces")
             html = """<!DOCTYPE html>
 <html lang="en">
@@ -1594,6 +1745,11 @@ class Stream:
       background: transparent; border: 1px solid #7f1d1d; color: #fca5a5; cursor: pointer; transition: all 0.15s;
     }
     .btn-danger-sm:hover { background: rgba(239,68,68,0.12); border-color: var(--danger); color: #fff; }
+    .btn-edit-sm {
+      padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 600;
+      background: transparent; border: 1px solid var(--primary); color: var(--primary); cursor: pointer; transition: all 0.15s;
+    }
+    .btn-edit-sm:hover { background: rgba(59,130,246,0.12); border-color: var(--primary-hover); color: #fff; }
     .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
     .divider { height: 1px; background: var(--border); margin: 24px 0; }
@@ -1712,12 +1868,29 @@ class Stream:
     </div>
   </div>
 
+  <!-- Edit Name Modal -->
+  <div id="editModal" class="modal-overlay">
+    <div class="modal">
+      <h3 id="eTitle">Edit Name</h3>
+      <p class="sub" style="margin-bottom:20px;">Update the display label for this face.</p>
+      <div class="field-group" style="margin-bottom:20px;">
+        <label>New Name</label>
+        <input type="text" id="eNameInput" placeholder="Enter new name" maxlength="80">
+      </div>
+      <div class="modal-actions">
+        <button class="btn-modal-cancel" onclick="closeEditModal()">Cancel</button>
+        <button class="btn-modal-confirm" id="eConfirm" onclick="confirmEdit()">Save</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     // ── State ──────────────────────────────────────────────────────────
     let stream       = null;   // MediaStream
     let capturedBlob = null;   // Blob from webcam snapshot
     let fileBlob     = null;   // Blob from file picker
     let pendingDeleteId = null;
+    let pendingEditId   = null;
     let facingMode   = 'user'; // 'user' = front, 'environment' = back
 
     // ── Tab switching ──────────────────────────────────────────────────
@@ -1915,6 +2088,7 @@ class Stream:
               <div class="face-name">${escHtml(f.display_name)}</div>
               <div class="face-meta">${escHtml(f.filename)} &middot; ${formatDate(f.added_at)}</div>
             </div>
+            <button class="btn-edit-sm"   onclick="askEdit(${f.id}, '${escHtml(f.display_name)}')">Edit</button>
             <button class="btn-danger-sm" onclick="askDelete(${f.id}, '${escHtml(f.display_name)}')">Delete</button>
           </div>`).join('');
       } catch (e) {
@@ -1953,7 +2127,50 @@ class Stream:
       }
     }
 
+
     // ── Utilities ──────────────────────────────────────────────────────
+    // Edit Name functions
+    function askEdit(id, currentName) {
+      pendingEditId = id;
+      document.getElementById('eTitle').textContent = 'Edit "' + currentName + '"';
+      document.getElementById('eNameInput').value = currentName;
+      document.getElementById('eNameInput').focus();
+      document.getElementById('editModal').style.display = 'flex';
+    }
+
+    function closeEditModal() {
+      document.getElementById('editModal').style.display = 'none';
+      pendingEditId = null;
+      document.getElementById('eNameInput').value = '';
+    }
+
+    async function confirmEdit() {
+      if (!pendingEditId) return;
+      const faceId = pendingEditId;
+      const newName = document.getElementById('eNameInput').value.trim();
+      if (!newName) {
+        showFeedback('Please enter a name.', true);
+        return;
+      }
+      closeEditModal();
+      try {
+        const res  = await fetch('/faces/' + faceId, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ display_name: newName })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          showFeedback('Name updated to "' + newName + '".', false);
+          loadFacesList();
+        } else {
+          showFeedback('Error: ' + (data.detail || 'Update failed'), true);
+        }
+      } catch (e) {
+        showFeedback('Network error: ' + e.message, true);
+      }
+    }
+
     function showFeedback(msg, isErr) {
       const fb = document.getElementById('feedback');
       fb.textContent  = msg;
@@ -1976,6 +2193,10 @@ class Stream:
       if (e.target === document.getElementById('modal')) closeModal();
     });
 
+    document.getElementById('editModal').addEventListener('click', e => {
+      if (e.target === document.getElementById('editModal')) closeEditModal();
+    });
+
     // Init
     loadFacesList();
   </script>
@@ -1984,12 +2205,16 @@ class Stream:
             return HTMLResponse(content=html.replace("{{NAV_BAR}}", nav_html))
 
         @app.get("/faces/list")
-        def faces_list():
+        def faces_list(request: Request):
+            # Dashboard auth guard (JSON API)
+            self._require_dashboard_auth(request)
             return JSONResponse({"faces": faces_db.list_faces()})
 
         @app.get("/faces/thumb/{filename}")
-        def faces_thumb(filename: str):
+        def faces_thumb(filename: str, request: Request):
             """Serve a face image by filename (basename only, no path traversal)."""
+            # Dashboard auth guard (JSON API)
+            self._require_dashboard_auth(request)
             import re as _re
             # Sanitise: only allow safe basenames
             if not _re.match(r'^[\w\-. ]+$', filename) or '..' in filename:
@@ -2005,6 +2230,8 @@ class Stream:
 
         @app.post("/faces/add")
         async def faces_add(request: Request, background_tasks: BackgroundTasks):
+            # Dashboard auth guard (JSON API)
+            self._require_dashboard_auth(request)
             content_type = request.headers.get("content-type", "")
             name = ""
             raw_bytes = b""
@@ -2059,7 +2286,9 @@ class Stream:
             return JSONResponse(result, status_code=201)
 
         @app.delete("/faces/{face_id}")
-        async def faces_delete(face_id: int, background_tasks: BackgroundTasks):
+        async def faces_delete(face_id: int, request: Request, background_tasks: BackgroundTasks):
+            # Dashboard auth guard (JSON API)
+            self._require_dashboard_auth(request)
             deleted = faces_db.delete_face(face_id, delete_file=True)
             if not deleted:
                 raise HTTPException(status_code=404, detail="Face not found")
@@ -2068,6 +2297,174 @@ class Stream:
 
             print(f"[Faces] Deleted face id={face_id}")
             return {"status": "ok", "deleted_id": face_id}
+
+        @app.patch("/faces/{face_id}")
+        async def faces_rename(face_id: int, request: Request, background_tasks: BackgroundTasks):
+            # Dashboard auth guard (JSON API)
+            self._require_dashboard_auth(request)
+            body = await request.json()
+            new_name = (body.get("display_name") or "").strip()
+
+            if not new_name:
+                raise HTTPException(status_code=400, detail="display_name is required")
+
+            try:
+                updated = faces_db.update_face_name(face_id, new_name)
+            except ValueError as ve:
+                raise HTTPException(status_code=400, detail=str(ve))
+
+            if not updated:
+                raise HTTPException(status_code=404, detail="Face not found")
+
+            background_tasks.add_task(self._reload_faces)
+
+            print(f"[Faces] Renamed face id={face_id} to '{new_name}'")
+            return {"status": "ok", "face_id": face_id, "display_name": new_name}
+
+        # -------------------------------------------------------------
+        # DASHBOARD LOGIN / LOGOUT
+        # -------------------------------------------------------------
+        LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GuideBot — Login</title>
+  <style>
+    :root { --bg: #090a0f; --surface: #13151c; --border: #222634; --text: #f1f5f9; --muted: #94a3b8; --primary: #3b82f6; --primary-hover: #2563eb; --danger: #ef4444; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }
+    body { background: var(--bg); color: var(--text); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 40px; width: 100%; max-width: 400px; box-shadow: 0 16px 40px rgba(0,0,0,0.5); }
+    h1 { font-size: 20px; font-weight: 700; margin-bottom: 8px; text-align: center; }
+    p.sub { font-size: 13px; color: var(--muted); text-align: center; margin-bottom: 28px; }
+    .field-group { margin-bottom: 18px; }
+    label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: var(--muted); }
+    input[type=email], input[type=password] { width: 100%; padding: 11px 14px; background: #1a1d27; border: 1px solid var(--border); border-radius: 10px; color: #fff; font-size: 14px; outline: none; }
+    input[type=email]:focus, input[type=password]:focus { border-color: var(--primary); }
+    .btn { width: 100%; padding: 11px; border-radius: 10px; border: none; font-size: 14px; font-weight: 600; cursor: pointer; }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+    .feedback { margin-top: 16px; font-size: 13px; text-align: center; }
+    .feedback.error { color: #fca5a5; }
+    .feedback.success { color: #a7f3d0; }
+    .hint { font-size: 12px; color: var(--muted); margin-top: 20px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Sign In</h1>
+    <p class="sub">Enter your email and password to access the GuideBot dashboard</p>
+    <form id="loginForm" novalidate>
+      <div class="field-group">
+        <label for="email">Email Address</label>
+        <input type="email" id="email" placeholder="you@example.com" required autocomplete="email">
+      </div>
+      <div class="field-group">
+        <label for="password">Password</label>
+        <input type="password" id="password" placeholder="Your password" required autocomplete="current-password">
+      </div>
+      <button class="btn btn-primary" type="submit">Sign In</button>
+    </form>
+    <div id="feedback" class="feedback"></div>
+    <p class="hint">Accounts are managed by the administrator — contact them to be added.</p>
+  </div>
+  <script>
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = document.getElementById('email').value.trim();
+      const password = document.getElementById('password').value;
+      const feedback = document.getElementById('feedback');
+      feedback.textContent = '';
+      feedback.className = 'feedback';
+
+      if (!email || !password) {
+        feedback.className = 'feedback error';
+        feedback.textContent = 'Email and password are required.';
+        return;
+      }
+
+      try {
+        const res = await fetch('/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password })
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+          feedback.className = 'feedback success';
+          feedback.textContent = 'Logged in. Redirecting...';
+          const next = new URLSearchParams(window.location.search).get('next') || '/';
+          setTimeout(() => { window.location.href = next; }, 600);
+        } else {
+          feedback.className = 'feedback error';
+          feedback.textContent = data.detail || 'Login failed.';
+        }
+      } catch (err) {
+        feedback.className = 'feedback error';
+        feedback.textContent = 'Network error: ' + err.message;
+      }
+    });
+  </script>
+</body>
+</html>"""
+
+        @app.get("/login", response_class=HTMLResponse)
+        async def login_page(request: Request):
+            auth = self._require_dashboard_auth_html(request)
+            if isinstance(auth, str):
+                next_url = request.query_params.get("next", "/")
+                return RedirectResponse(url=next_url, status_code=307)
+            if auth is None:
+                return RedirectResponse(url="/", status_code=307)
+            return HTMLResponse(content=LOGIN_HTML)
+
+        @app.post("/login")
+        async def login_submit(request: Request):
+            body = await request.json()
+            email = (body.get("email") or "").strip().lower()
+            password = body.get("password") or ""
+
+            if not email or not password:
+                raise HTTPException(status_code=400, detail="Email and password are required")
+
+            # Evaluate both checks before failing so timing does not reveal
+            # whether the email itself exists (generic error below).
+            allowed = emails_db.is_allowed(email)
+            pw_ok = emails_db.verify_password(email, password)
+            if not allowed:
+                raise HTTPException(status_code=401, detail="Invalid email or password")
+            if not emails_db.has_password(email):
+                # This user was registered but has no password yet.
+                raise HTTPException(
+                    status_code=409,
+                    detail="No password set for this account. Ask the admin to run: "
+                           f"python update_email.py set-password {email}",
+                )
+            if not pw_ok:
+                raise HTTPException(status_code=401, detail="Invalid email or password")
+
+            token = self._create_session(email)
+            response = JSONResponse({"status": "ok", "email": email, "redirect": request.query_params.get("next", "/")})
+            response.set_cookie(
+                key="guidebot_session",
+                value=token,
+                httponly=True,
+                secure=False,
+                samesite="lax",
+                max_age=int(self.session_timeout.total_seconds()),
+                path="/",
+            )
+            return response
+
+        @app.post("/logout")
+        async def logout(request: Request):
+            token = request.cookies.get("guidebot_session")
+            self._clear_session(token)
+            response = RedirectResponse(url="/login", status_code=307)
+            response.delete_cookie(key="guidebot_session", path="/")
+            return response
 
         server_config = uvicorn.Config(
             app=app,

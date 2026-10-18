@@ -1,9 +1,13 @@
 venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 models/
 data/known_faces/
 data/currency_model/
+# Dashboard email/password registry (allowed login emails + password hashes)
+data/allowed_emails.db*
 .vscode/
 .env
 secrets.h
