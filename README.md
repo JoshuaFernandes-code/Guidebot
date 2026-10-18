@@ -255,7 +255,6 @@ Press `q` in the video window to quit cleanly.
 - [x] Text reading (OCR with EasyOCR)
 - [x] Face recognition (InsightFace) + web management dashboard (`/faces`)
 - [x] Local LLM assistant integration (Ollama / Llama 3.2)
-- [ ] Currency recognition
 - [ ] Scene description
 - [ ] Final polish + wearable enclosure build
 
@@ -263,4 +262,5 @@ Press `q` in the video window to quit cleanly.
 
 ## Author
 
-Joshua Fernandes — B.E. Electronics and Computer Engineering, Agnel Institute of Engineering and Management, Goa University
+* [**Joshua Fernandes**](https://github.com/JoshuaFernandes-code) — B.E. Electronics and Computer Engineering, Agnel Institute of Engineering and Management, Goa University
+* [**Nathan Lobo**](https://github.com/nathanlobo) — B.E. Electronics and Computer Engineering, Agnel Institute of Engineering and Management, Goa University
