@@ -61,10 +61,7 @@ class Stream:
         self._tts_loop = None  # asyncio event loop, captured at first /ws/tts-feed connect
 
         self.auth_token = CONFIG.get("stream_auth_token", "")
-        # Dashboard session store: {token: {"email": str, "expires_at": datetime}}
-        self.sessions: dict = {}
         self.session_timeout = timedelta(hours=24)
-        self._sessions_lock = threading.Lock()
         self.host = CONFIG.get("receiver_host", "0.0.0.0")
         self.port = int(CONFIG.get("receiver_port", 8000))
         self.stream_lan_host = discover_stream_lan_host(CONFIG.get("stream_lan_host", ""))
@@ -96,42 +93,30 @@ class Stream:
         token = secrets.token_urlsafe(32)
         expires_at = datetime.now(timezone.utc) + self.session_timeout
         pw_ts = emails_db.get_password_updated_at(email) or ""
-        with self._sessions_lock:
-            self.sessions[token] = {"email": email, "expires_at": expires_at, "pw_ts": pw_ts}
-        # Clean up expired sessions
-        self._purge_expired_sessions()
+        emails_db.create_dashboard_session(token, email, expires_at, pw_ts)
         return token
 
     def _validate_session(self, token: str | None) -> str | None:
         """Validate a session token. Returns the email if valid, None otherwise."""
         if not token:
             return None
-        with self._sessions_lock:
-            session = self.sessions.get(token)
-            if session is None:
-                return None
-            if datetime.now(timezone.utc) > session["expires_at"]:
-                del self.sessions[token]
-                return None
-            email = session["email"]
-            # Drop sessions created before THAT user's last password change.
-            if (session.get("pw_ts") or "") != (emails_db.get_password_updated_at(email) or ""):
-                del self.sessions[token]
-                return None
-            return email
+        session = emails_db.get_dashboard_session(token)
+        if session is None:
+            return None
+        if datetime.now(timezone.utc) > datetime.fromisoformat(session["expires_at"]):
+            emails_db.delete_dashboard_session(token)
+            return None
+        email = session["email"]
+        # Drop sessions created before THAT user's last password change.
+        if (session.get("pw_ts") or "") != (emails_db.get_password_updated_at(email) or ""):
+            emails_db.delete_dashboard_session(token)
+            return None
+        return email
 
     def _clear_session(self, token: str | None) -> None:
         """Remove a session token."""
         if token:
-            with self._sessions_lock:
-                self.sessions.pop(token, None)
-
-    def _purge_expired_sessions(self) -> None:
-        """Remove all expired sessions (caller must hold _sessions_lock)."""
-        now = datetime.now(timezone.utc)
-        expired = [t for t, s in self.sessions.items() if now > s["expires_at"]]
-        for t in expired:
-            del self.sessions[t]
+            emails_db.delete_dashboard_session(token)
 
     def _require_dashboard_auth(self, request: Request) -> str:
         """Check dashboard authentication.
@@ -430,7 +415,9 @@ class Stream:
       --text: #f1f5f9; --muted: #94a3b8; --primary: #3b82f6;
     }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }}
+    html, body {{ width: 100%; max-width: 100%; overflow-x: clip; }}
     body {{ background: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: calc(16px + env(safe-area-inset-top, 0px)) 16px 32px; -webkit-font-smoothing: antialiased; }}
+    .dashboard-kicker, .dashboard-jumps, .dashboard-grid {{ display: none; }}
     
     .app-nav-bar {{
       position: sticky; top: 8px; z-index: 1000; margin: 0 auto 24px;
@@ -438,7 +425,7 @@ class Stream:
       background: rgba(19, 21, 28, 0.92); border: 1px solid var(--border);
       border-radius: 14px; padding: 10px 8px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
       box-shadow: 0 8px 30px rgba(0,0,0,0.55);
-      width: 100%; max-width: 560px;
+      width: min(100%, 560px); max-width: 100%;
     }}
     .nav-row {{
       display: flex; align-items: center; gap: 6px; width: 100%;
@@ -459,23 +446,47 @@ class Stream:
       .nav-row {{ display: contents; }}
     }}
     .logout-control-wide {{ display: none !important; }}
-    @media (min-width: 900px) {{
+    @media (min-width: 768px) {{
+      body {{ align-items: stretch; padding: 28px clamp(24px, 4vw, 64px) 40px; }}
+      .app-nav-bar {{ display: none; }}
       .logout-control {{ display: none !important; }}
-      .logout-control-wide {{ display: inline !important; position: fixed; top: 16px; right: 24px; z-index: 1001; }}
+      .logout-control-wide {{ display: inline !important; position: fixed; top: 18px; right: 24px; z-index: 1001; }}
+      h1 {{ font-size: clamp(32px, 4vw, 54px); letter-spacing: -0.04em; }}
+      p.sub {{ margin-bottom: 0; max-width: 660px; line-height: 1.6; }}
+      .dashboard-main {{ width: 100%; max-width: 1560px; margin: 0 auto; }}
+      .dashboard-header {{ padding: 34px 0 26px; }}
+      .dashboard-kicker {{ display: block; color: #60a5fa; font-size: 11px; font-weight: 800; letter-spacing: .16em; margin-bottom: 10px; }}
+      .dashboard-jumps {{ display: flex; flex-wrap: wrap; gap: 10px; padding: 0 0 24px; }}
+      .dashboard-jumps a {{ color: #cbd5e1; text-decoration: none; font-size: 13px; font-weight: 650; padding: 9px 14px; border: 1px solid var(--border); border-radius: 999px; background: rgba(19,21,28,.8); }}
+      .dashboard-jumps a:hover {{ color: #fff; border-color: var(--primary); }}
+      .grid {{ display: none !important; }}
+      .dashboard-grid {{ display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }}
+      .dashboard-panel {{ min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 20px; background: linear-gradient(145deg, rgba(19,21,28,.96), rgba(13,15,22,.96)); box-shadow: 0 18px 48px rgba(0,0,0,.24); scroll-margin-top: 24px; }}
+      .dashboard-panel-header {{ display: flex; align-items: center; gap: 12px; padding: 18px 22px 14px; }}
+      .dashboard-panel-icon {{ display: grid; place-items: center; width: 38px; height: 38px; flex: 0 0 38px; border: 1px solid #334155; border-radius: 12px; background: #1a2232; font-size: 19px; }}
+      .dashboard-panel-header h2 {{ font-size: 16px; font-weight: 750; }}
+      .dashboard-panel-header p {{ margin-top: 3px; color: var(--muted); font-size: 12px; }}
+      .dashboard-panel iframe {{ display: block; width: 100%; min-height: 260px; border: 0; }}
+      footer {{ margin-top: 28px; align-self: center; }}
+    }}
+    @media (min-width: 1080px) {{
+      .dashboard-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 22px; }}
+      #faces-section {{ grid-column: 1 / -1; }}
     }}
 
-    h1 {{ font-size: 28px; font-weight: 800; margin-bottom: 6px; }}
-    p.sub {{ color: var(--muted); font-size: 14px; margin-bottom: 40px; }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; width: 100%; max-width: 640px; }}
+    h1 {{ width: 100%; max-width: 640px; font-size: 28px; font-weight: 800; margin-bottom: 6px; }}
+    p.sub {{ width: 100%; max-width: 640px; color: var(--muted); font-size: 14px; margin-bottom: 40px; }}
+    .grid {{ display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; width: 100%; max-width: 640px; }}
     .nav-card {{
       background: var(--surface); border: 1px solid var(--border); border-radius: 18px;
-      padding: 28px 20px; display: flex; flex-direction: column; align-items: center; gap: 12px;
+      min-width: 0; padding: 16px 18px; display: flex; flex-direction: row; align-items: center; gap: 12px;
       text-decoration: none; color: var(--text); font-size: 15px; font-weight: 600;
       transition: all 0.15s; cursor: pointer;
     }}
     .nav-card:hover {{ border-color: var(--primary); background: #181c2a; }}
     .nav-card.disabled {{ opacity: 0.4; cursor: not-allowed; pointer-events: none; }}
-    .nav-card > :first-child {{ font-size: 36px; }}
+    .nav-card > :first-child {{ font-size: 28px; }}
+    .nav-card small {{ margin-left: auto; text-align: right; }}
     small {{ font-size: 11px; color: var(--muted); font-weight: 400; }}
     .status-dot {{ width: 8px; height: 8px; border-radius: 50%; background: #10b981; display: inline-block; margin-right: 6px; }}
     footer {{ margin-top: 40px; font-size: 12px; color: var(--muted); }}
@@ -483,14 +494,64 @@ class Stream:
 </head>
 <body>
   {nav_html}
-  <h1>🦯 GuideBot</h1>
-  <p class="sub">AI-powered navigation assistant — server is <span class="status-dot"></span>online</p>
-  <div class="grid">
-    <a href="/esp" class="nav-card">📡<span>ESP Control</span><small>Wi-Fi &amp; device</small></a>
-    <a href="/faces" class="nav-card">🧑‍🤝‍🧑<span>Known Faces</span><small>Add &amp; manage</small></a>
-    {audio_link}
-  </div>
-  <footer>GuideBot Stream Receiver &mdash; port {self.port}</footer>
+  <main class="dashboard-main">
+    <header class="dashboard-header">
+      <div class="dashboard-kicker">GUIDEBOT · ACCESSIBILITY CONSOLE</div>
+      <h1>🦯 GuideBot</h1>
+      <p class="sub">Your navigation assistant, device controls, voice tools, and known faces — together in one workspace.</p>
+    </header>
+    <nav class="dashboard-jumps" aria-label="Dashboard sections">
+      <a href="#esp-section">📡 Device</a>
+      {f'<a href="#voice-section">🎤 Voice</a>' if use_web_mic else ''}
+      <a href="#faces-section">🧑‍🤝‍🧑 Known faces</a>
+    </nav>
+    <div class="grid">
+      <a href="/esp" class="nav-card">📡<span>ESP Control</span><small>Wi-Fi &amp; device</small></a>
+      <a href="/faces" class="nav-card">🧑‍🤝‍🧑<span>Known Faces</span><small>Add &amp; manage</small></a>
+      {audio_link}
+    </div>
+    <div class="dashboard-grid">
+      <section class="dashboard-panel" id="esp-section">
+        <div class="dashboard-panel-header"><span class="dashboard-panel-icon">📡</span><div><h2>Device &amp; Wi-Fi</h2><p>Connection status, network setup, and ESP microphone</p></div></div>
+        <iframe title="ESP device and Wi-Fi controls" src="/esp?dashboard_embed=1" loading="lazy" allow="camera; microphone"></iframe>
+      </section>
+      {'''<section class="dashboard-panel" id="voice-section">
+        <div class="dashboard-panel-header"><span class="dashboard-panel-icon">🎤</span><div><h2>Voice tools</h2><p>Talk to GuideBot, send commands, and manage voice output</p></div></div>
+        <iframe title="Voice input and output controls" src="/audio?dashboard_embed=1" loading="lazy" allow="microphone"></iframe>
+      </section>''' if use_web_mic else ''}
+      <section class="dashboard-panel" id="faces-section">
+        <div class="dashboard-panel-header"><span class="dashboard-panel-icon">🧑‍🤝‍🧑</span><div><h2>Known faces</h2><p>Add, identify, and manage people recognized by GuideBot</p></div></div>
+        <iframe title="Known face management" src="/faces?dashboard_embed=1" loading="lazy" allow="camera"></iframe>
+      </section>
+    </div>
+    <footer>GuideBot Stream Receiver &mdash; port {self.port}</footer>
+  </main>
+  <script>
+    const embeddedFrames = document.querySelectorAll('.dashboard-panel iframe');
+    const embedStyles = `
+      html, body {{ height: auto !important; min-height: 0 !important; overflow: hidden !important; background: transparent !important; }}
+      body {{ display: block !important; padding: 0 !important; margin: 0 !important; }}
+      .app-nav-bar, .logout-control-wide, footer, .back-link {{ display: none !important; }}
+      .card {{ width: 100% !important; max-width: none !important; margin: 0 !important; padding: clamp(18px, 2.4vw, 30px) !important; border-radius: 0 !important; box-shadow: none !important; }}
+    `;
+    embeddedFrames.forEach(frame => frame.addEventListener('load', () => {{
+      const doc = frame.contentDocument;
+      const style = doc.createElement('style');
+      style.textContent = embedStyles;
+      if (frame.closest('#faces-section')) {{
+        style.textContent += '#videoWrap, #previewImg {{ max-width: 440px; margin-left: auto; margin-right: auto; }}';
+      }}
+      doc.head.appendChild(style);
+      const resize = () => {{
+        const height = Math.max(doc.body.scrollHeight, doc.documentElement.scrollHeight);
+        if (Math.abs(frame.getBoundingClientRect().height - height) > 2) frame.style.height = height + 'px';
+      }};
+      const observer = new ResizeObserver(resize);
+      observer.observe(doc.body);
+      observer.observe(doc.documentElement);
+      resize();
+    }}));
+  </script>
 </body>
 </html>"""
             return HTMLResponse(content=html)

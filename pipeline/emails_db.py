@@ -17,6 +17,13 @@ settings(
     setting_value TEXT NOT NULL
 )
 
+dashboard_sessions(
+    token       TEXT PRIMARY KEY,
+    email       TEXT NOT NULL,
+    expires_at  TEXT NOT NULL,
+    pw_ts       TEXT NOT NULL
+)
+
 Each allowed email has its OWN password, stored ONLY as a PBKDF2-HMAC-SHA256
 hash (never plaintext) and manageable only through update_email.py.
 Changing a user's password bumps their password_updated_at, which
@@ -74,6 +81,14 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS settings (
             setting_key   TEXT PRIMARY KEY,
             setting_value TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS dashboard_sessions (
+            token       TEXT PRIMARY KEY,
+            email       TEXT NOT NULL,
+            expires_at  TEXT NOT NULL,
+            pw_ts       TEXT NOT NULL
         )
     """)
     # Per-user password columns (added after the shared-password era).
@@ -330,6 +345,41 @@ def get_password_updated_at(email: str) -> str | None:
             (_normalize_email(email),),
         ).fetchone()
     return row["password_updated_at"] if row and row["password_updated_at"] else None
+
+
+def create_dashboard_session(
+    token: str, email: str, expires_at: datetime, pw_ts: str
+) -> None:
+    """Persist an opaque dashboard session until expiry or explicit logout."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _lock:
+        conn = _get_conn()
+        conn.execute(
+            "INSERT INTO dashboard_sessions (token, email, expires_at, pw_ts) "
+            "VALUES (?, ?, ?, ?)",
+            (token, _normalize_email(email), expires_at.isoformat(), pw_ts),
+        )
+        conn.execute("DELETE FROM dashboard_sessions WHERE expires_at <= ?", (now,))
+        conn.commit()
+
+
+def get_dashboard_session(token: str) -> dict | None:
+    """Return the persisted session record for an opaque token, if present."""
+    with _lock:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT email, expires_at, pw_ts FROM dashboard_sessions WHERE token = ?",
+            (token,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_dashboard_session(token: str) -> None:
+    """Revoke a dashboard session token."""
+    with _lock:
+        conn = _get_conn()
+        conn.execute("DELETE FROM dashboard_sessions WHERE token = ?", (token,))
+        conn.commit()
 
 
 def users_without_password() -> list:
