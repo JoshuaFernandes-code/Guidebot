@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 from config import CONFIG
 from pipeline import faces_db, emails_db
+from pipeline.networking import discover_stream_lan_host
 
 try:
     import uvicorn
@@ -66,6 +67,7 @@ class Stream:
         self._sessions_lock = threading.Lock()
         self.host = CONFIG.get("receiver_host", "0.0.0.0")
         self.port = int(CONFIG.get("receiver_port", 8000))
+        self.stream_lan_host = discover_stream_lan_host(CONFIG.get("stream_lan_host", ""))
         self.url = CONFIG.get("stream_url", "http://10.254.76.220/stream")
 
         self.cap = None
@@ -74,17 +76,17 @@ class Stream:
         self.server_thread = None
 
         if self.mode == "push_receiver":
+            print("[Stream] Building push-receiver routes...")
             self._start_push_receiver()
         else:
+            print(f"[Stream] Starting pull client for {self.url}...")
             self._start_pull_client()
 
     # -------------------------------------------------------------
     # PUSH RECEIVER (Cloudflare Tunnel / Ingestion Server)
     # -------------------------------------------------------------
     def _validate_token(self, provided_token: str | None) -> bool:
-        if not self.auth_token:
-            return True
-        return provided_token == self.auth_token
+        return bool(self.auth_token) and provided_token == self.auth_token
 
     # -------------------------------------------------------------
     # DASHBOARD SESSION MANAGEMENT
@@ -131,16 +133,17 @@ class Stream:
         for t in expired:
             del self.sessions[t]
 
-    def _require_dashboard_auth(self, request: Request) -> str | None:
+    def _require_dashboard_auth(self, request: Request) -> str:
         """Check dashboard authentication.
 
-        Returns the authenticated email if valid, or None if no allowed emails
-        are registered (dashboard is open). Raises HTTPException(401) if
-        unauthenticated and auth is required.
+        Returns the authenticated email or raises HTTPException if login is
+        not configured or the session is unauthenticated.
         """
         if not emails_db.list_emails():
-            # No allowed emails registered — dashboard is open
-            return None
+            raise HTTPException(
+                status_code=503,
+                detail="Dashboard login is not configured. Register an account on the server.",
+            )
 
         token = request.cookies.get("guidebot_session")
         email = self._validate_session(token)
@@ -152,16 +155,15 @@ class Stream:
             )
         return email
 
-    def _require_dashboard_auth_html(self, request: Request) -> str | RedirectResponse | None:
+    def _require_dashboard_auth_html(self, request: Request) -> str | RedirectResponse:
         """Like _require_dashboard_auth but redirects to /login for HTML clients.
 
         Returns:
             str: authenticated email if valid
-            None: if no allowed emails are registered (dashboard is open)
             RedirectResponse: if unauthenticated, redirect to /login
         """
         if not emails_db.list_emails():
-            return None
+            return RedirectResponse(url="/login?setup=required", status_code=303)
 
         token = request.cookies.get("guidebot_session")
         email = self._validate_session(token)
@@ -337,6 +339,34 @@ class Stream:
         app = FastAPI(title="GuideBot Stream Ingestion Server", docs_url=None, redoc_url=None)
         self.app = app
 
+        @app.middleware("http")
+        async def require_dashboard_login(request: Request, call_next):
+            if request.url.path in {"/login", "/frame"}:
+                return await call_next(request)
+
+            if not emails_db.list_emails():
+                if request.method in {"GET", "HEAD"} and "text/html" in request.headers.get("accept", ""):
+                    return RedirectResponse(url="/login?setup=required", status_code=303)
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Dashboard login is not configured. Register an account on the server."},
+                )
+
+            token = request.cookies.get("guidebot_session")
+            email = self._validate_session(token)
+            if email is None or not emails_db.is_allowed(email):
+                if request.method in {"GET", "HEAD"} and "text/html" in request.headers.get("accept", ""):
+                    return RedirectResponse(
+                        url=f"/login?next={request.url.path}", status_code=303
+                    )
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Authentication required"},
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
+            return await call_next(request)
+
         def render_nav_tabs(active_tab: str) -> str:
             use_web_mic = CONFIG.get("use_web_mic", False)
             tabs = [
@@ -347,12 +377,29 @@ class Stream:
             if use_web_mic:
                 tabs.append(("audio", "/audio", "🎤 Voice Input"))
 
-            links = []
-            for tid, path, label in tabs:
+            def tab(tid: str, path: str, label: str) -> str:
                 cls = "app-tab active" if tid == active_tab else "app-tab"
-                links.append(f'<a href="{path}" class="{cls}">{label}</a>')
-            links.append('<a href="#" class="app-tab" onclick="fetch(\'/logout\', {method: \'POST\'}).then(() => window.location.href = \'/login\'); return false;" title="Sign out">🚪 Logout</a>')
-            return f'<nav class="app-nav-bar">{"".join(links)}</nav>'
+                return f'<a href="{path}" class="{cls}">{label}</a>'
+
+            def logout_control(class_name: str) -> str:
+                return (
+                    f'<form action="/logout" method="post" class="{class_name}" style="display:inline;margin:0">'
+                    '<button type="submit" class="app-tab" style="background:none;border:0;cursor:pointer" '
+                    'title="Sign out">🚪 Logout</button></form>'
+                )
+
+            # Row 1: Home; Logout moves to the viewport edge on wide screens.
+            top_row = tab("home", "/", "🏠 Home") + logout_control("logout-control")
+            # Row 2: the remaining nav buttons (ESP, Faces, Voice Input)
+            bottom_row = "".join(tab(tid, path, label) for tid, path, label in tabs if tid != "home")
+
+            return (
+                '<nav class="app-nav-bar">'
+                f'<div class="nav-row top">{top_row}</div>'
+                f'<div class="nav-row bottom">{bottom_row}</div>'
+                "</nav>"
+                + logout_control("logout-control-wide")
+            )
 
         @app.get("/")
         def home(request: Request):
@@ -383,21 +430,39 @@ class Stream:
       --text: #f1f5f9; --muted: #94a3b8; --primary: #3b82f6;
     }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }}
-    body {{ background: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: 80px 16px 32px 16px; -webkit-font-smoothing: antialiased; }}
+    body {{ background: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding: calc(16px + env(safe-area-inset-top, 0px)) 16px 32px; -webkit-font-smoothing: antialiased; }}
     
     .app-nav-bar {{
-      position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 1000;
-      display: inline-flex; align-items: center; gap: 6px;
+      position: sticky; top: 8px; z-index: 1000; margin: 0 auto 24px;
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
       background: rgba(19, 21, 28, 0.92); border: 1px solid var(--border);
-      border-radius: 999px; padding: 6px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      border-radius: 14px; padding: 10px 8px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
       box-shadow: 0 8px 30px rgba(0,0,0,0.55);
+      width: 100%; max-width: 560px;
     }}
+    .nav-row {{
+      display: flex; align-items: center; gap: 6px; width: 100%;
+    }}
+    .nav-row.top  {{ justify-content: space-between; }}
+    .nav-row.bottom {{ justify-content: center; flex-wrap: wrap; }}
     .app-tab {{
-      padding: 8px 18px; border-radius: 999px; text-decoration: none; color: #94a3b8;
+      padding: 8px 14px; border-radius: 999px; text-decoration: none; color: #94a3b8;
       font-size: 13px; font-weight: 600; transition: all 0.15s; white-space: nowrap;
+      flex: 0 0 auto;
     }}
     .app-tab:hover {{ color: #fff; background: rgba(255,255,255,0.08); }}
     .app-tab.active {{ background: var(--primary); color: #fff; box-shadow: 0 2px 10px rgba(59,130,246,0.45); }}
+
+    /* Desktop: keep all tabs in a single centered row */
+    @media (min-width: 640px) {{
+      .app-nav-bar {{ flex-direction: row; flex-wrap: nowrap; justify-content: center; }}
+      .nav-row {{ display: contents; }}
+    }}
+    .logout-control-wide {{ display: none !important; }}
+    @media (min-width: 900px) {{
+      .logout-control {{ display: none !important; }}
+      .logout-control-wide {{ display: inline !important; position: fixed; top: 16px; right: 24px; z-index: 1001; }}
+    }}
 
     h1 {{ font-size: 28px; font-weight: 800; margin-bottom: 6px; }}
     p.sub {{ color: var(--muted); font-size: 14px; margin-bottom: 40px; }}
@@ -458,6 +523,37 @@ class Stream:
 
             return Response(content='{"status":"ok"}', media_type="application/json")
 
+        @app.websocket("/ws/frame")
+        async def websocket_frame(websocket: WebSocket):
+            token = websocket.query_params.get("token") or websocket.headers.get("X-Auth-Token")
+            if not self._validate_token(token):
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+
+            await websocket.accept()
+            print("[Stream Receiver] ESP32 connected directly over LAN for video.")
+            try:
+                while self.running:
+                    message = await websocket.receive()
+                    if message["type"] == "websocket.disconnect":
+                        print(
+                            "[Stream Receiver] Direct LAN video disconnected "
+                            f"(code={message.get('code')}, reason={message.get('reason', '')!r})."
+                        )
+                        break
+                    if "bytes" in message and message["bytes"]:
+                        if not await asyncio.to_thread(
+                            self._process_frame_bytes, message["bytes"]
+                        ):
+                            print("[Stream Receiver] Dropped invalid LAN frame payload.")
+                    elif message.get("text", "").strip() == "PING":
+                        await websocket.send_text("PONG")
+            except WebSocketDisconnect as exc:
+                print(
+                    "[Stream Receiver] Direct LAN video disconnected "
+                    f"(code={exc.code}, reason={exc.reason!r})."
+                )
+
         async def broadcast_esp_status(connected: bool):
             msg = json.dumps({"type": "esp_status", "connected": connected})
             dead_clients = set()
@@ -491,13 +587,11 @@ class Stream:
 
         @app.websocket("/ws/tts-feed")
         async def tts_feed(websocket: WebSocket):
-            # Dashboard auth guard (cookie session) when login is active
-            if emails_db.list_emails():
-                token = websocket.cookies.get("guidebot_session")
-                email = self._validate_session(token)
-                if email is None or not emails_db.is_allowed(email):
-                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                    return
+            token = websocket.cookies.get("guidebot_session")
+            email = self._validate_session(token)
+            if email is None or not emails_db.is_allowed(email):
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
 
             await websocket.accept()
             self._tts_loop = asyncio.get_running_loop()
@@ -522,6 +616,11 @@ class Stream:
 
             await websocket.accept()
             print("[Stream Receiver] ESP32 connected via WebSocket.")
+
+            if self.stream_lan_host:
+                await websocket.send_text(
+                    f"STREAM_TARGET:{self.stream_lan_host}:{self.port}"
+                )
 
             # Set connection references
             self.esp_ws = websocket
@@ -552,11 +651,28 @@ class Stream:
                     if message["type"] == "websocket.disconnect":
                         break
                     if "bytes" in message and message["bytes"]:
-                        self._process_frame_bytes(message["bytes"])
+                        await asyncio.to_thread(
+                            self._process_frame_bytes, message["bytes"]
+                        )
                     elif "text" in message and message["text"]:
                         txt = message["text"].strip()
-                        # Check for scan results response from ESP
-                        if txt.startswith("SCAN_RESULTS:"):
+                        if txt == "PING":
+                            await websocket.send_text("PONG")
+                        elif txt == "GET_STREAM_TARGET":
+                            self.stream_lan_host = discover_stream_lan_host(
+                                CONFIG.get("stream_lan_host", "")
+                            )
+                            if self.stream_lan_host:
+                                await websocket.send_text(
+                                    f"STREAM_TARGET:{self.stream_lan_host}:{self.port}"
+                                )
+                                print(
+                                    f"[Stream Receiver] Refreshed LAN video target: "
+                                    f"{self.stream_lan_host}:{self.port}"
+                                )
+                            else:
+                                await websocket.send_text("STREAM_TARGET_UNAVAILABLE")
+                        elif txt.startswith("SCAN_RESULTS:"):
                             try:
                                 json_part = txt[len("SCAN_RESULTS:"):]
                                 networks = json.loads(json_part)
@@ -631,21 +747,39 @@ class Stream:
       --success: #10b981;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }
-    body { background: var(--bg); color: var(--text); padding: 80px 16px 32px 16px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; min-height: 100vh; -webkit-font-smoothing: antialiased; }
+    body { background: var(--bg); color: var(--text); padding: calc(16px + env(safe-area-inset-top, 0px)) 16px 32px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; min-height: 100vh; -webkit-font-smoothing: antialiased; }
     
     .app-nav-bar {
-      position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 1000;
-      display: inline-flex; align-items: center; gap: 6px;
+      position: sticky; top: 8px; z-index: 1000; margin: 0 auto 24px;
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
       background: rgba(19, 21, 28, 0.92); border: 1px solid var(--border);
-      border-radius: 999px; padding: 6px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      border-radius: 14px; padding: 10px 8px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
       box-shadow: 0 8px 30px rgba(0,0,0,0.55);
+      width: 100%; max-width: 560px;
     }
+    .nav-row {
+      display: flex; align-items: center; gap: 6px; width: 100%;
+    }
+    .nav-row.top  { justify-content: space-between; }
+    .nav-row.bottom { justify-content: center; flex-wrap: wrap; }
     .app-tab {
-      padding: 8px 18px; border-radius: 999px; text-decoration: none; color: #94a3b8;
+      padding: 8px 14px; border-radius: 999px; text-decoration: none; color: #94a3b8;
       font-size: 13px; font-weight: 600; transition: all 0.15s; white-space: nowrap;
+      flex: 0 0 auto;
     }
     .app-tab:hover { color: #fff; background: rgba(255,255,255,0.08); }
     .app-tab.active { background: var(--primary); color: #fff; box-shadow: 0 2px 10px rgba(59,130,246,0.45); }
+
+    /* Desktop: keep all tabs in a single centered row */
+    @media (min-width: 640px) {
+      .app-nav-bar { flex-direction: row; flex-wrap: nowrap; justify-content: center; }
+      .nav-row { display: contents; }
+    }
+    .logout-control-wide { display: none !important; }
+    @media (min-width: 900px) {
+      .logout-control { display: none !important; }
+      .logout-control-wide { display: inline !important; position: fixed; top: 16px; right: 24px; z-index: 1001; }
+    }
 
     .card { background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 28px; width: 100%; max-width: 440px; box-shadow: 0 16px 40px rgba(0,0,0,0.5); }
     h1 { font-size: 20px; font-weight: 700; text-align: center; margin-bottom: 4px; }
@@ -839,9 +973,12 @@ class Stream:
           body: JSON.stringify({ command: text })
         });
         const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Server rejected the command");
+        }
         showFeedback("Sent: '" + text + "'");
       } catch (err) {
-        showFeedback("Failed to send command", true);
+        showFeedback("Failed to send command: " + err.message, true);
       }
     }
 
@@ -935,6 +1072,8 @@ class Stream:
 
             @app.post("/audio/command")
             async def submit_audio_command(request: Request):
+                client = request.client.host if request.client else "unknown"
+                print(f"[Voice / Web] Command request received from {client}.")
                 # Dashboard auth guard (JSON API)
                 self._require_dashboard_auth(request)
                 body = await request.json()
@@ -943,10 +1082,14 @@ class Stream:
                     raise HTTPException(status_code=400, detail="Empty command")
                 if self.voice_input:
                     self.voice_input.submit_command(command)
+                else:
+                    print("[Voice / Web] Command dropped: voice input is unavailable.")
                 return {"status": "ok", "command": command}
 
             @app.post("/audio/upload")
             async def upload_audio_recording(request: Request):
+                client = request.client.host if request.client else "unknown"
+                print(f"[Voice / Web] Audio upload received from {client}.")
                 # Dashboard auth guard (JSON API)
                 self._require_dashboard_auth(request)
                 if not self.voice_input:
@@ -955,6 +1098,7 @@ class Stream:
                 content = await request.body()
                 if not content:
                     raise HTTPException(status_code=400, detail="Empty audio content")
+                print(f"[Voice / Web] Processing {len(content)} audio bytes with Whisper.")
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
                     tmp.write(content)
@@ -962,6 +1106,8 @@ class Stream:
 
                 try:
                     text = self.voice_input.transcribe_audio_file(tmp_path)
+                    if not text:
+                        print("[Voice / Web] Whisper produced no usable command.")
                     return {"status": "ok", "transcription": text}
                 finally:
                     if os.path.exists(tmp_path):
@@ -1002,21 +1148,39 @@ class Stream:
       --warning: #f59e0b;
     }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }}
-    body {{ background: var(--bg); color: var(--text); padding: 80px 16px 32px 16px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; min-height: 100vh; -webkit-font-smoothing: antialiased; }}
+    body {{ background: var(--bg); color: var(--text); padding: calc(16px + env(safe-area-inset-top, 0px)) 16px 32px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; min-height: 100vh; -webkit-font-smoothing: antialiased; }}
     
     .app-nav-bar {{
-      position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 1000;
-      display: inline-flex; align-items: center; gap: 6px;
+      position: sticky; top: 8px; z-index: 1000; margin: 0 auto 24px;
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
       background: rgba(19, 21, 28, 0.92); border: 1px solid var(--border);
-      border-radius: 999px; padding: 6px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      border-radius: 14px; padding: 10px 8px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
       box-shadow: 0 8px 30px rgba(0,0,0,0.55);
+      width: 100%; max-width: 560px;
     }}
+    .nav-row {{
+      display: flex; align-items: center; gap: 6px; width: 100%;
+    }}
+    .nav-row.top  {{ justify-content: space-between; }}
+    .nav-row.bottom {{ justify-content: center; flex-wrap: wrap; }}
     .app-tab {{
-      padding: 8px 18px; border-radius: 999px; text-decoration: none; color: #94a3b8;
+      padding: 8px 14px; border-radius: 999px; text-decoration: none; color: #94a3b8;
       font-size: 13px; font-weight: 600; transition: all 0.15s; white-space: nowrap;
+      flex: 0 0 auto;
     }}
     .app-tab:hover {{ color: #fff; background: rgba(255,255,255,0.08); }}
     .app-tab.active {{ background: var(--primary); color: #fff; box-shadow: 0 2px 10px rgba(59,130,246,0.45); }}
+
+    /* Desktop: keep all tabs in a single centered row */
+    @media (min-width: 640px) {{
+      .app-nav-bar {{ flex-direction: row; flex-wrap: nowrap; justify-content: center; }}
+      .nav-row {{ display: contents; }}
+    }}
+    .logout-control-wide {{ display: none !important; }}
+    @media (min-width: 900px) {{
+      .logout-control {{ display: none !important; }}
+      .logout-control-wide {{ display: inline !important; position: fixed; top: 16px; right: 24px; z-index: 1001; }}
+    }}
 
     .card {{ background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 28px; width: 100%; max-width: 460px; box-shadow: 0 16px 40px rgba(0,0,0,0.5); }}
     .header {{ text-align: center; margin-bottom: 24px; }}
@@ -1262,7 +1426,18 @@ class Stream:
 
       try {{
         const res = await fetch("/esp/scan", {{ method: "POST" }});
+        const contentType = res.headers.get("content-type") || "";
+        if (!contentType.includes("application/json")) {{
+          const message = res.status === 503
+            ? "Scan service is temporarily unavailable (HTTP 503). Check the server/tunnel and try again."
+            : `Scan request failed (HTTP ${{res.status}}): server returned an unexpected response.`;
+          throw new Error(message);
+        }}
         const data = await res.json();
+        if (!res.ok) {{
+          showFeedback(data.detail || `Scan request failed (HTTP ${{res.status}}).`, true);
+          return;
+        }}
         if (data.status === "ok") {{
           select.innerHTML = '<option value="">-- Select a Scanned Network --</option>';
           if (data.networks && data.networks.length > 0) {{
@@ -1491,14 +1666,13 @@ class Stream:
 
         @app.websocket("/ws/esp-status")
         async def websocket_esp_status(websocket: WebSocket):
-            # Dashboard socket — requires a valid login session when active.
+            # Dashboard socket — requires a valid login session.
             # (Distinct from /ws/stream, which is the ESP's STREAM_AUTH_TOKEN channel.)
-            if emails_db.list_emails():
-                token = websocket.cookies.get("guidebot_session")
-                email = self._validate_session(token)
-                if email is None or not emails_db.is_allowed(email):
-                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                    return
+            token = websocket.cookies.get("guidebot_session")
+            email = self._validate_session(token)
+            if email is None or not emails_db.is_allowed(email):
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
             await websocket.accept()
             self.dash_clients.add(websocket)
             # Immediately send initial state
@@ -1662,21 +1836,39 @@ class Stream:
       --danger-hover: #dc2626; --warning: #f59e0b;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif; }
-    body { background: var(--bg); color: var(--text); padding: 80px 16px 32px 16px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; min-height: 100vh; -webkit-font-smoothing: antialiased; }
+    body { background: var(--bg); color: var(--text); padding: calc(16px + env(safe-area-inset-top, 0px)) 16px 32px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; min-height: 100vh; -webkit-font-smoothing: antialiased; }
     
     .app-nav-bar {
-      position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 1000;
-      display: inline-flex; align-items: center; gap: 6px;
+      position: sticky; top: 8px; z-index: 1000; margin: 0 auto 24px;
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
       background: rgba(19, 21, 28, 0.92); border: 1px solid var(--border);
-      border-radius: 999px; padding: 6px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      border-radius: 14px; padding: 10px 8px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
       box-shadow: 0 8px 30px rgba(0,0,0,0.55);
+      width: 100%; max-width: 560px;
     }
+    .nav-row {
+      display: flex; align-items: center; gap: 6px; width: 100%;
+    }
+    .nav-row.top  { justify-content: space-between; }
+    .nav-row.bottom { justify-content: center; flex-wrap: wrap; }
     .app-tab {
-      padding: 8px 18px; border-radius: 999px; text-decoration: none; color: #94a3b8;
+      padding: 8px 14px; border-radius: 999px; text-decoration: none; color: #94a3b8;
       font-size: 13px; font-weight: 600; transition: all 0.15s; white-space: nowrap;
+      flex: 0 0 auto;
     }
     .app-tab:hover { color: #fff; background: rgba(255,255,255,0.08); }
     .app-tab.active { background: var(--primary); color: #fff; box-shadow: 0 2px 10px rgba(59,130,246,0.45); }
+
+    /* Desktop: keep all tabs in a single centered row */
+    @media (min-width: 640px) {
+      .app-nav-bar { flex-direction: row; flex-wrap: nowrap; justify-content: center; }
+      .nav-row { display: contents; }
+    }
+    .logout-control-wide { display: none !important; }
+    @media (min-width: 900px) {
+      .logout-control { display: none !important; }
+      .logout-control-wide { display: inline !important; position: fixed; top: 16px; right: 24px; z-index: 1001; }
+    }
 
     .card { background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 28px; width: 100%; max-width: 520px; box-shadow: 0 16px 40px rgba(0,0,0,0.5); }
     .header { text-align: center; margin-bottom: 28px; }
@@ -2412,16 +2604,36 @@ class Stream:
 
         @app.get("/login", response_class=HTMLResponse)
         async def login_page(request: Request):
-            auth = self._require_dashboard_auth_html(request)
-            if isinstance(auth, str):
-                next_url = request.query_params.get("next", "/")
-                return RedirectResponse(url=next_url, status_code=307)
-            if auth is None:
-                return RedirectResponse(url="/", status_code=307)
-            return HTMLResponse(content=LOGIN_HTML)
+            allowed_emails = emails_db.list_emails()
+            if allowed_emails:
+                token = request.cookies.get("guidebot_session")
+                email = self._validate_session(token)
+                if email is not None and emails_db.is_allowed(email):
+                    next_url = request.query_params.get("next", "/")
+                    if not next_url.startswith("/") or next_url.startswith("//"):
+                        next_url = "/"
+                    return RedirectResponse(url=next_url, status_code=303)
+                return HTMLResponse(content=LOGIN_HTML)
+
+            setup_notice = (
+                '<p class="hint setup-notice">No dashboard account is configured. '
+                'On the server, run <code>python update_email.py add your-email@example.com</code>, '
+                'then <code>python update_email.py set-password your-email@example.com</code>.</p>'
+            )
+            setup_page = LOGIN_HTML.replace(
+                '<form id="loginForm" novalidate>',
+                setup_notice + '<form id="loginForm" novalidate hidden>',
+            )
+            return HTMLResponse(content=setup_page)
 
         @app.post("/login")
         async def login_submit(request: Request):
+            if not emails_db.list_emails():
+                raise HTTPException(
+                    status_code=503,
+                    detail="Dashboard login is not configured. Register an account on the server.",
+                )
+
             body = await request.json()
             email = (body.get("email") or "").strip().lower()
             password = body.get("password") or ""
@@ -2446,7 +2658,10 @@ class Stream:
                 raise HTTPException(status_code=401, detail="Invalid email or password")
 
             token = self._create_session(email)
-            response = JSONResponse({"status": "ok", "email": email, "redirect": request.query_params.get("next", "/")})
+            next_url = request.query_params.get("next", "/")
+            if not next_url.startswith("/") or next_url.startswith("//"):
+                next_url = "/"
+            response = JSONResponse({"status": "ok", "email": email, "redirect": next_url})
             response.set_cookie(
                 key="guidebot_session",
                 value=token,
@@ -2462,10 +2677,11 @@ class Stream:
         async def logout(request: Request):
             token = request.cookies.get("guidebot_session")
             self._clear_session(token)
-            response = RedirectResponse(url="/login", status_code=307)
+            response = RedirectResponse(url="/login", status_code=303)
             response.delete_cookie(key="guidebot_session", path="/")
             return response
 
+        print("[Stream] Routes ready; starting receiver thread...")
         server_config = uvicorn.Config(
             app=app,
             host=self.host,
@@ -2554,10 +2770,19 @@ class Stream:
     # PUBLIC API
     # -------------------------------------------------------------
     def get_frame(self):
+        frame, _, _ = self.get_frame_with_metadata()
+        return frame
+
+    def get_frame_with_metadata(self):
+        """Return the latest frame plus the stream sequence number and capture time."""
         with self.lock:
             if self.latest_frame is None:
-                return None
-            return self.latest_frame.copy()
+                return None, 0, 0.0
+            return self.latest_frame.copy(), self.frame_count, self.latest_timestamp
+
+    def get_received_frame_count(self):
+        with self.lock:
+            return self.frame_count
 
     def is_alive(self, timeout: float = 3.0) -> bool:
         with self.lock:

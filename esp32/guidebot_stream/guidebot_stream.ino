@@ -61,6 +61,10 @@
 
 // Hotspot SSID for initial setup (open, no password required)
 #define AP_SSID "GuideBot-Setup"
+#define MAX_SAVED_NETWORKS 5
+const unsigned long SERVER_HEARTBEAT_INTERVAL_MS = 10000;
+const unsigned long SERVER_TIMEOUT_MS = 35000;
+const unsigned long WIFI_PROFILE_CONNECT_TIMEOUT_MS = 15000;
 
 // ============================================================================
 // RUNTIME CONFIGURATION (Stored in ESP32 Flash Memory via Preferences)
@@ -74,6 +78,22 @@ int    config_wifi_auth_mode = -1;
 
 bool   config_is_configured = false;
 bool   config_mic_enabled   = false;   // Stored in Preferences; toggled from dashboard
+
+struct SavedNetwork {
+    String ssid;
+    String password;
+    int auth_mode = -1;
+};
+
+SavedNetwork savedNetworks[MAX_SAVED_NETWORKS];
+int savedNetworkCount = 0;
+int activeNetworkIndex = 0;
+int networksTried = 0;
+unsigned long lastServerMessageMs = 0;
+unsigned long lastHeartbeatMs = 0;
+bool setupPortalActive = false;
+bool portalRoutesStarted = false;
+bool portalServerStarted = false;
 
 Preferences prefs;
 DNSServer dnsServer;
@@ -103,6 +123,75 @@ struct AccessPoint {
 };
 
 AccessPoint pending_roam_ap;
+
+int16_t waitForWifiScan(unsigned long timeout_ms) {
+    int16_t count = WiFi.scanComplete();
+    unsigned long started = millis();
+    while (count == WIFI_SCAN_RUNNING && millis() - started < timeout_ms) {
+        delay(50);
+        count = WiFi.scanComplete();
+    }
+    return count;
+}
+
+int16_t scanWifiNetworks() {
+    int16_t count = WiFi.scanComplete();
+    if (count == WIFI_SCAN_RUNNING) {
+        count = waitForWifiScan(15000);
+    }
+    roaming_scan_active = false;
+    if (count >= 0) return count;
+    if (count == WIFI_SCAN_RUNNING) {
+        Serial.println("[WiFi] Existing scan is still running; not starting another.");
+        return count;
+    }
+
+    WiFi.scanDelete();
+    for (int attempt = 1; attempt <= 2; ++attempt) {
+        count = WiFi.scanNetworks();
+        if (count == WIFI_SCAN_RUNNING) {
+            count = waitForWifiScan(15000);
+        }
+        if (count >= 0) return count;
+        Serial.printf("[WiFi] Scan attempt %d failed with code %d (mode=%d, status=%d).\n",
+                      attempt, count, (int)WiFi.getMode(), (int)WiFi.status());
+        if (count == WIFI_SCAN_RUNNING) return count;
+        WiFi.scanDelete();
+        delay(250);
+    }
+    return WIFI_SCAN_FAILED;
+}
+
+int findSavedNetwork(const String &ssid, int auth_mode = -1) {
+    for (int i = 0; i < savedNetworkCount; ++i) {
+        if (savedNetworks[i].ssid == ssid &&
+            (auth_mode < 0 || savedNetworks[i].auth_mode < 0 ||
+             savedNetworks[i].auth_mode == auth_mode)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void rememberNetwork(const String &ssid, const String &password, int auth_mode) {
+    if (!ssid.length()) return;
+
+    int index = findSavedNetwork(ssid, auth_mode);
+    if (index < 0) {
+        if (savedNetworkCount == MAX_SAVED_NETWORKS) {
+            Serial.printf("[WiFi] Saved-network limit reached; removing oldest profile '%s'.\n",
+                          savedNetworks[0].ssid.c_str());
+            for (int i = 1; i < savedNetworkCount; ++i) {
+                savedNetworks[i - 1] = savedNetworks[i];
+            }
+            --savedNetworkCount;
+        }
+        index = savedNetworkCount++;
+    }
+    savedNetworks[index].ssid = ssid;
+    savedNetworks[index].password = password;
+    savedNetworks[index].auth_mode = auth_mode;
+}
 
 bool sameBssid(const uint8_t *left, const uint8_t *right) {
     return memcmp(left, right, 6) == 0;
@@ -160,7 +249,7 @@ void beginAccessPointConnection(const String &ssid, const String &password, cons
 }
 
 bool beginBestAccessPointConnection(const String &ssid, const String &password, int auth_mode) {
-    int count = WiFi.scanNetworks();
+    int count = scanWifiNetworks();
     AccessPoint best;
     bool found = count > 0 && findBestAccessPoint(ssid, auth_mode, count, best);
     WiFi.scanDelete();
@@ -188,7 +277,7 @@ String groupedScanResultsJson(int count) {
                 ",\"channel\":" + String(WiFi.channel(i)) +
                 ",\"auth\":" + String(WiFi.encryptionType(i)) +
                 ",\"open\":" + (isOpen ? "true" : "false") +
-                ",\"saved\":" + (WiFi.SSID(i) == config_ssid ? "true" : "false") + "}";
+                ",\"saved\":" + (findSavedNetwork(WiFi.SSID(i), WiFi.encryptionType(i)) >= 0 ? "true" : "false") + "}";
     }
     return json + "]";
 }
@@ -245,6 +334,19 @@ void loadConfiguration() {
         config_wifi_auth_mode = -1;
         config_mic_enabled = false;
     }
+    savedNetworkCount = (int)prefs.getUInt("net_count", 0);
+    if (savedNetworkCount > MAX_SAVED_NETWORKS) {
+        savedNetworkCount = MAX_SAVED_NETWORKS;
+    }
+    for (int i = 0; i < savedNetworkCount; ++i) {
+        String suffix = String(i);
+        savedNetworks[i].ssid = prefs.getString(("net_ssid" + suffix).c_str(), "");
+        savedNetworks[i].password = prefs.getString(("net_pass" + suffix).c_str(), "");
+        savedNetworks[i].auth_mode = prefs.getInt(("net_auth" + suffix).c_str(), -1);
+    }
+    if (savedNetworkCount == 0 && config_ssid.length()) {
+        rememberNetwork(config_ssid, config_password, config_wifi_auth_mode);
+    }
     prefs.end();
 
     sanitizeConfig();
@@ -266,6 +368,9 @@ void saveConfiguration(const String& new_ssid, const String& new_pass, const Str
     config_wifi_auth_mode = new_auth_mode;
     config_is_configured = (new_ssid.length() > 0);
     sanitizeConfig();
+    rememberNetwork(config_ssid, config_password, config_wifi_auth_mode);
+    activeNetworkIndex = findSavedNetwork(config_ssid, config_wifi_auth_mode);
+    networksTried = 1;
 
     prefs.begin("guidebot", false);
     prefs.putBool("configured", config_is_configured);
@@ -276,6 +381,13 @@ void saveConfiguration(const String& new_ssid, const String& new_pass, const Str
     prefs.putString("token", config_auth_token);
     prefs.putInt("wifi_auth", config_wifi_auth_mode);
     prefs.putBool("mic_enabled", config_mic_enabled);
+    prefs.putUInt("net_count", (uint32_t)savedNetworkCount);
+    for (int i = 0; i < savedNetworkCount; ++i) {
+        String suffix = String(i);
+        prefs.putString(("net_ssid" + suffix).c_str(), savedNetworks[i].ssid);
+        prefs.putString(("net_pass" + suffix).c_str(), savedNetworks[i].password);
+        prefs.putInt(("net_auth" + suffix).c_str(), savedNetworks[i].auth_mode);
+    }
     prefs.end();
     Serial.println("[Config] Successfully saved new credentials to flash.");
 }
@@ -297,6 +409,9 @@ void performClearCredentials() {
     config_password      = "";
     config_wifi_auth_mode = -1;
     config_mic_enabled   = false;
+    savedNetworkCount = 0;
+    activeNetworkIndex = 0;
+    networksTried = 0;
     Serial.println("[Config] Stored Wi-Fi erased & hardware cache wiped successfully.");
 }
 
@@ -384,7 +499,88 @@ void captureAndSendAudio();
 // ============================================================================
 #if USE_WEBSOCKET
   WebSocketsClient webSocket;
+  WebSocketsClient lanWebSocket;
   bool is_connected = false;
+  bool lan_is_connected = false;
+  bool lan_target_refresh_requested = false;
+  bool lan_target_refresh_in_flight = false;
+  String lan_stream_host;
+  int lan_stream_port = 0;
+  unsigned long lastLanTargetRequestMs = 0;
+  unsigned long lastLanSendFailureLogMs = 0;
+  const unsigned long LAN_TARGET_REFRESH_INTERVAL_MS = 10000;
+  const unsigned long LAN_SEND_FAILURE_LOG_INTERVAL_MS = 2000;
+
+  void recordServerResponse() {
+      lastServerMessageMs = millis();
+      networksTried = 1;
+  }
+
+  void configureLanStreaming(const String &target, bool forceReconnect = false) {
+      int port_separator = target.lastIndexOf(':');
+      if (port_separator <= 0 || port_separator == target.length() - 1) {
+          Serial.println("[Stream] Ignoring invalid LAN stream target");
+          return;
+      }
+
+      String host = target.substring(0, port_separator);
+      int port = target.substring(port_separator + 1).toInt();
+      if (!host.length() || port <= 0 || port > 65535) {
+          Serial.println("[Stream] Ignoring invalid LAN stream target");
+          return;
+      }
+      if (host == lan_stream_host && port == lan_stream_port && !forceReconnect) return;
+
+      lanWebSocket.disconnect();
+      lan_stream_host = host;
+      lan_stream_port = port;
+      lan_is_connected = false;
+      lan_target_refresh_requested = false;
+      lan_target_refresh_in_flight = false;
+      String wsPath = String("/ws/frame?token=") + config_auth_token;
+      lanWebSocket.onEvent([](WStype_t type, uint8_t *payload, size_t length) {
+          if (type == WStype_CONNECTED) {
+              lan_is_connected = true;
+              lastServerMessageMs = millis();
+              Serial.printf("[Stream] Direct LAN video connected to %s:%d\n",
+                            lan_stream_host.c_str(), lan_stream_port);
+          } else if (type == WStype_TEXT && length == 4 &&
+                     memcmp(payload, "PONG", 4) == 0) {
+              recordServerResponse();
+          } else if (type == WStype_DISCONNECTED || type == WStype_ERROR) {
+              bool wasConnected = lan_is_connected;
+              lan_is_connected = false;
+              if (wasConnected) {
+                  lan_target_refresh_requested = true;
+              }
+              if (type == WStype_DISCONNECTED) {
+                  Serial.println("[Stream] Direct LAN video disconnected; using tunnel fallback");
+              } else {
+                  Serial.println("[Stream] Direct LAN video socket error; using tunnel fallback");
+              }
+          }
+      });
+      lanWebSocket.begin(lan_stream_host.c_str(), lan_stream_port, wsPath.c_str());
+      lanWebSocket.setReconnectInterval(2000);
+      Serial.printf("[Stream] Trying direct LAN video at ws://%s:%d%s\n",
+                    lan_stream_host.c_str(), lan_stream_port, wsPath.c_str());
+  }
+
+  void requestLanStreamTarget() {
+      if (!lan_target_refresh_requested || !is_connected) return;
+      unsigned long now = millis();
+      if (lastLanTargetRequestMs &&
+          now - lastLanTargetRequestMs < LAN_TARGET_REFRESH_INTERVAL_MS) return;
+
+      lastLanTargetRequestMs = now;
+      if (webSocket.sendTXT("GET_STREAM_TARGET")) {
+          lan_target_refresh_requested = false;
+          lan_target_refresh_in_flight = true;
+          Serial.println("[Stream] Requesting a fresh direct-LAN video target over tunnel");
+      } else {
+          Serial.println("[Stream] Could not request a fresh LAN target; will retry");
+      }
+  }
 
   void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       switch(type) {
@@ -394,6 +590,8 @@ void captureAndSendAudio();
               break;
           case WStype_CONNECTED:
               is_connected = true;
+              lastServerMessageMs = millis();
+              lastHeartbeatMs = 0;
               Serial.printf("[WS] Connected to: %s\n", payload);
               webSocket.sendTXT("DEVICE_INFO:{\"ssid\":\"" + config_ssid + "\"}");
               break;
@@ -404,9 +602,17 @@ void captureAndSendAudio();
                   msg += (char)payload[i];
               }
               msg.trim();
+              lastServerMessageMs = millis();
               Serial.printf("[WS] Server command: '%s'\n", msg.c_str());
 
-              if (msg.startsWith("FORCE_HIGH_RES:")) {
+              if (msg == "PONG") {
+                  recordServerResponse();
+              } else if (msg.startsWith("STREAM_TARGET:")) {
+                  configureLanStreaming(msg.substring(14), lan_target_refresh_in_flight);
+              } else if (msg == "STREAM_TARGET_UNAVAILABLE") {
+                  lan_target_refresh_in_flight = false;
+                  Serial.println("[Stream] Server could not provide a direct-LAN video target; using tunnel");
+              } else if (msg.startsWith("FORCE_HIGH_RES:")) {
                   force_high_res = msg.substring(15).toInt() == 1;
                   Serial.printf("[Adaptive] Force high res: %s\n",
                                 force_high_res ? "YES (always VGA)" : "NO (adaptive)");
@@ -461,11 +667,23 @@ void captureAndSendAudio();
   }
 
   void sendFrame(camera_fb_t *fb) {
-      bool ok = webSocket.sendBIN(fb->buf, fb->len);
+      WebSocketsClient &videoSocket = lan_is_connected ? lanWebSocket : webSocket;
+      bool ok = videoSocket.sendBIN(fb->buf, fb->len);
       if (ok) {
           adaptive_frame_count++;
       } else {
-          Serial.println("[WS] Frame send FAILED (buffer full or network lag)");
+          if (lan_is_connected) {
+              lan_is_connected = false;
+              lan_target_refresh_requested = true;
+              unsigned long now = millis();
+              if (!lastLanSendFailureLogMs ||
+                  now - lastLanSendFailureLogMs >= LAN_SEND_FAILURE_LOG_INTERVAL_MS) {
+                  lastLanSendFailureLogMs = now;
+                  Serial.println("[WS] LAN frame send failed; falling back to tunnel and refreshing target");
+              }
+          } else {
+              Serial.println("[WS] Tunnel frame send FAILED (buffer full or network lag)");
+          }
       }
   }
 
@@ -613,8 +831,13 @@ void captureAndSendAudio();
 // ============================================================================
 void handlePortalRoot() {
     Serial.println("[Portal] Scanning nearby Wi-Fi networks...");
-    int n = WiFi.scanNetworks();
-    Serial.printf("[Portal] Found %d networks\n", n);
+    int n = scanWifiNetworks();
+    if (n < 0) {
+        Serial.printf("[Portal] Wi-Fi scan failed with code %d (mode=%d, status=%d); manual SSID entry is available.\n",
+                      n, (int)WiFi.getMode(), (int)WiFi.status());
+    } else {
+        Serial.printf("[Portal] Found %d networks\n", n);
+    }
 
     bool is_wifi_live = (WiFi.status() == WL_CONNECTED);
 
@@ -752,6 +975,11 @@ void handlePortalRoot() {
         html += "<strong>Mode: Setup Hotspot Active</strong><br>";
         html += "Connected via <code>GuideBot-Setup</code> (192.168.4.1). Enter network credentials below.</div>";
     }
+    if (n < 0) {
+        html += "<div class='status-card status-hotspot'>Wi-Fi scan failed (";
+        html += String(n);
+        html += "). Enter the network name manually below.</div>";
+    }
 
     // Save Form
     html += "<form id='saveForm' action='/save' method='POST' onsubmit='return validateSaveForm()'>";
@@ -760,7 +988,7 @@ void handlePortalRoot() {
     html += "<div class='field-group'><label>Wi-Fi Network</label>";
     html += "<input type='hidden' id='wifiAuth' name='auth' value='-1'>";
     html += "<select name='ssid' onchange='onSsidChange(this)'>";
-    if (n == 0) {
+    if (n <= 0) {
         html += "<option value='__custom__'>No networks found (Enter manually)</option>";
     } else {
         for (int i = 0; i < n; ++i) {
@@ -770,7 +998,7 @@ void handlePortalRoot() {
             String netName = WiFi.SSID(i);
             int rssi = WiFi.RSSI(i);
             bool isOpen = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
-            bool isSaved = netName == config_ssid && (config_wifi_auth_mode < 0 || WiFi.encryptionType(i) == config_wifi_auth_mode);
+            bool isSaved = findSavedNetwork(netName, WiFi.encryptionType(i)) >= 0;
             String isCurrent = isSaved ? " selected" : "";
             html += "<option value='" + netName + "' data-open='" + (isOpen ? "1" : "0") + "' data-saved='" + (isSaved ? "1" : "0") + "' data-auth='" + String(WiFi.encryptionType(i)) + "'" + isCurrent + ">";
             html += (isOpen ? "&#128275; " : "&#128274; ") + netName + " (" + (isOpen ? "Open" : String(rssi) + " dBm") + (isSaved ? " - Saved" : "") + ")</option>";
@@ -780,7 +1008,7 @@ void handlePortalRoot() {
     html += "</select></div>";
 
     // Custom SSID Box
-    html += "<div id='custom_ssid_box' class='field-group' style='display:" + String(n == 0 ? "block" : "none") + ";'>";
+    html += "<div id='custom_ssid_box' class='field-group' style='display:" + String(n <= 0 ? "block" : "none") + ";'>";
     html += "<label>Network Name (SSID)</label>";
     html += "<input type='text' id='customSsid' name='custom_ssid' placeholder='Enter network SSID'>";
     html += "</div>";
@@ -829,6 +1057,7 @@ void handlePortalRoot() {
 
     html += "</body></html>";
 
+    if (n >= 0) WiFi.scanDelete();
     portalServer.send(200, "text/html", html);
 }
 
@@ -851,8 +1080,9 @@ void handlePortalSave() {
     }
 
     // If reconnecting to previously saved network with empty password, use previous password
-    if (selected_ssid == config_ssid && new_pass.length() == 0) {
-        new_pass = config_password;
+    int saved_index = findSavedNetwork(selected_ssid, new_auth_mode);
+    if (saved_index >= 0 && new_pass.length() == 0) {
+        new_pass = savedNetworks[saved_index].password;
     }
 
     saveConfiguration(selected_ssid, new_pass, new_host, new_token, new_auth_mode);
@@ -912,19 +1142,28 @@ void startConfigPortal() {
     Serial.println("2. Open browser and visit: http://192.168.4.1");
     Serial.println("========================================================\n");
 
-    WiFi.disconnect(true);
-    delay(100);
-    WiFi.mode(WIFI_AP);
+    WiFi.mode(WiFi.status() == WL_CONNECTED ? WIFI_AP_STA : WIFI_AP);
     WiFi.softAP(AP_SSID);
 
     IPAddress apIP = WiFi.softAPIP();
     Serial.printf("[Portal] Hotspot active at IP: %s\n", apIP.toString().c_str());
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("[Portal] Station connection remains active at IP: %s\n",
+                      WiFi.localIP().toString().c_str());
+    }
+    setupPortalActive = true;
 
     // Start DNS server redirecting all domain queries to 192.168.4.1 (Captive Portal)
     dnsServer.start(53, "*", apIP);
 
-    setupPortalRoutes();
-    portalServer.begin();
+    if (!portalRoutesStarted) {
+        setupPortalRoutes();
+        portalRoutesStarted = true;
+    }
+    if (!portalServerStarted) {
+        portalServer.begin();
+        portalServerStarted = true;
+    }
 
     // Stay in setup loop indefinitely until user saves credentials and device reboots
     while (true) {
@@ -1009,6 +1248,53 @@ bool initCamera() {
 unsigned long last_frame_time = 0;
 unsigned long wifi_disconnect_start = 0;
 
+void tryNextSavedNetwork(unsigned long now) {
+    if (setupPortalActive) return;
+    if (networksTried >= savedNetworkCount) {
+        Serial.println("[WiFi] No saved network can reach GuideBot. Opening Setup Hotspot...");
+        startConfigPortal();
+        return;
+    }
+
+    activeNetworkIndex = (activeNetworkIndex + 1) % savedNetworkCount;
+    ++networksTried;
+    roaming_in_progress = false;
+    pending_roam_ap.valid = false;
+    config_ssid = savedNetworks[activeNetworkIndex].ssid;
+    config_password = savedNetworks[activeNetworkIndex].password;
+    config_wifi_auth_mode = savedNetworks[activeNetworkIndex].auth_mode;
+    Serial.printf("[WiFi] Trying saved network %d/%d: '%s'\n",
+                  networksTried, savedNetworkCount, config_ssid.c_str());
+
+    #if USE_WEBSOCKET
+      webSocket.disconnect();
+      lanWebSocket.disconnect();
+      is_connected = false;
+      lan_is_connected = false;
+    #endif
+    WiFi.disconnect(false, false);
+    beginBestAccessPointConnection(config_ssid, config_password, config_wifi_auth_mode);
+    wifi_disconnect_start = millis();
+    lastServerMessageMs = wifi_disconnect_start;
+    lastHeartbeatMs = wifi_disconnect_start;
+}
+
+void checkServerCommunication(unsigned long now) {
+    #if USE_WEBSOCKET
+      if ((is_connected || lan_is_connected) &&
+          now - lastHeartbeatMs >= SERVER_HEARTBEAT_INTERVAL_MS) {
+          if (is_connected) webSocket.sendTXT("PING");
+          if (lan_is_connected) lanWebSocket.sendTXT("PING");
+          lastHeartbeatMs = now;
+      }
+    #endif
+
+    if (now - lastServerMessageMs >= SERVER_TIMEOUT_MS) {
+        Serial.println("[WiFi] No response from GuideBot server; changing saved network.");
+        tryNextSavedNetwork(now);
+    }
+}
+
 void checkWifiRoaming(unsigned long now) {
     if (config_wifi_auth_mode < 0 || !config_is_configured || config_ssid.length() == 0) {
         return;
@@ -1082,27 +1368,36 @@ void setup() {
 
     // Attempt to connect to saved Wi-Fi if available and configured
     bool connected = false;
-    if (config_is_configured && config_ssid.length() > 0) {
-        Serial.printf("[WiFi] Attempting to connect to '%s'", config_ssid.c_str());
+    if (config_is_configured && savedNetworkCount > 0) {
         WiFi.mode(WIFI_STA);
-        if (beginBestAccessPointConnection(config_ssid, config_password, config_wifi_auth_mode)) {
-            Serial.println(" using the strongest compatible access point.");
-        } else {
-            Serial.println(" using SSID-only fallback.");
-        }
+        int preferred_index = findSavedNetwork(config_ssid, config_wifi_auth_mode);
+        if (preferred_index < 0) preferred_index = 0;
+        for (int offset = 0; offset < savedNetworkCount && !connected; ++offset) {
+            activeNetworkIndex = (preferred_index + offset) % savedNetworkCount;
+            config_ssid = savedNetworks[activeNetworkIndex].ssid;
+            config_password = savedNetworks[activeNetworkIndex].password;
+            config_wifi_auth_mode = savedNetworks[activeNetworkIndex].auth_mode;
+            Serial.printf("[WiFi] Attempting saved network %d/%d: '%s'\n",
+                          offset + 1, savedNetworkCount, config_ssid.c_str());
+            beginBestAccessPointConnection(config_ssid, config_password, config_wifi_auth_mode);
 
-        unsigned long start_attempt = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - start_attempt < 10000) {
-            delay(500);
-            Serial.print(".");
-        }
+            unsigned long start_attempt = millis();
+            while (WiFi.status() != WL_CONNECTED &&
+                   millis() - start_attempt < WIFI_PROFILE_CONNECT_TIMEOUT_MS) {
+                delay(500);
+                Serial.print(".");
+            }
 
-        if (WiFi.status() == WL_CONNECTED) {
-            connected = true;
-            Serial.println("\n[WiFi] Connected successfully!");
-            Serial.printf("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
-        } else {
-            Serial.println("\n[WiFi] Could not connect to Wi-Fi within 10 seconds.");
+            if (WiFi.status() == WL_CONNECTED) {
+                connected = true;
+                networksTried = offset + 1;
+                lastServerMessageMs = millis();
+                Serial.println("\n[WiFi] Connected successfully!");
+                Serial.printf("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
+            } else {
+                Serial.printf("\n[WiFi] Could not connect to '%s'.\n", config_ssid.c_str());
+                WiFi.disconnect(false, false);
+            }
         }
     } else {
         Serial.println("[WiFi] No saved Wi-Fi credentials found.");
@@ -1113,8 +1408,14 @@ void setup() {
         startConfigPortal();
     } else {
         // Run live dashboard on local Wi-Fi IP so user can manage/erase settings anytime
-        setupPortalRoutes();
-        portalServer.begin();
+        if (!portalRoutesStarted) {
+            setupPortalRoutes();
+            portalRoutesStarted = true;
+        }
+        if (!portalServerStarted) {
+            portalServer.begin();
+            portalServerStarted = true;
+        }
 
         if (MDNS.begin("guidebot")) {
             MDNS.addService("http", "tcp", 80);
@@ -1209,8 +1510,9 @@ void loop() {
         }
         if (new_ssid.length() > 0) {
             // If reconnecting to previously saved network with empty password, use previous password
-            if (new_ssid == config_ssid && new_pass.length() == 0) {
-                new_pass = config_password;
+            int saved_index = findSavedNetwork(new_ssid, new_auth_mode);
+            if (saved_index >= 0 && new_pass.length() == 0) {
+                new_pass = savedNetworks[saved_index].password;
             }
             Serial.printf("[Remote] Saving new Wi-Fi '%s' and restarting...\n", new_ssid.c_str());
             saveConfiguration(new_ssid, new_pass, config_server_host, config_auth_token, new_auth_mode);
@@ -1230,17 +1532,17 @@ void loop() {
     if (flag_scan_wifi) {
         flag_scan_wifi = false;
         Serial.println("\n[Remote] Executing SCAN_WIFI request...");
-        if (roaming_scan_active) {
-            WiFi.scanDelete();
-            roaming_scan_active = false;
+        int n = scanWifiNetworks();
+        if (n < 0) {
+            Serial.printf("[Remote] Wi-Fi scan failed with code %d.\n", n);
+        } else {
+            Serial.printf("[Remote] Scan found %d networks\n", n);
         }
-        int n = WiFi.scanNetworks();
-        Serial.printf("[Remote] Scan found %d networks\n", n);
         String jsonResp = "SCAN_RESULTS:" + groupedScanResultsJson(n);
         #if USE_WEBSOCKET
           webSocket.sendTXT(jsonResp);
         #endif
-        WiFi.scanDelete();
+        if (n >= 0) WiFi.scanDelete();
     }
 
     // Keep web dashboard responsive at all times
@@ -1277,10 +1579,9 @@ void loop() {
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) esp_camera_fb_return(fb);
 
-        // If disconnected for more than 25 seconds, launch setup portal
-        if (millis() - wifi_disconnect_start > 25000) {
-            Serial.println("[WiFi] Reconnection timed out. Opening Setup Hotspot...");
-            startConfigPortal();
+        if (millis() - wifi_disconnect_start > WIFI_PROFILE_CONNECT_TIMEOUT_MS) {
+            Serial.println("[WiFi] Saved network is unavailable.");
+            tryNextSavedNetwork(millis());
         }
         delay(2);
         return;
@@ -1295,6 +1596,11 @@ void loop() {
 
     #if USE_WEBSOCKET
       webSocket.loop();
+      if (lan_stream_host.length()) {
+          lanWebSocket.loop();
+      }
+      requestLanStreamTarget();
+      checkServerCommunication(millis());
 
       static unsigned long last_ws_log = 0;
       if (!is_connected && (now - last_ws_log > 5000)) {
@@ -1310,7 +1616,7 @@ void loop() {
     bool should_send = (now - last_frame_time >= FRAME_INTERVAL_MS);
 
     #if USE_WEBSOCKET
-      if (should_send && is_connected) {
+      if (should_send && (is_connected || lan_is_connected)) {
           // Do not reset sensor timing while a frame buffer is checked out.
           checkAdaptiveResolution();
       }
@@ -1321,7 +1627,7 @@ void loop() {
         if (should_send) {
             last_frame_time = now;
             #if USE_WEBSOCKET
-              if (is_connected) {
+              if (is_connected || lan_is_connected) {
                   sendFrame(fb);
               }
             #else

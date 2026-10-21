@@ -17,3 +17,6 @@ graphify-out
 .gemini
 .qodo
 scratch
+guidebot.log
+logs/vision-frames/
+.playwright-mcp/

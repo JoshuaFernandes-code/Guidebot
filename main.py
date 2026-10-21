@@ -36,6 +36,7 @@ class InferencePipeline:
         self._latest_depth   = None    # depth_map numpy array
         self._latest_frame   = None    # frame that was actually inferred on
         self._latest_detections = []   # parsed detection dicts
+        self._latest_frame_info = None # source stream frame number and capture time
         self._inference_fps  = 0.0
 
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -44,7 +45,7 @@ class InferencePipeline:
     def _loop(self):
         prev = time.time()
         while self.running:
-            frame = self.stream.get_frame()
+            frame, frame_number, captured_at = self.stream.get_frame_with_metadata()
             if frame is None or frame.size == 0:
                 time.sleep(0.02)
                 continue
@@ -88,15 +89,21 @@ class InferencePipeline:
                 self._latest_depth      = depth_map
                 self._latest_frame      = frame_resized
                 self._latest_detections = detections
+                self._latest_frame_info = {
+                    "number": frame_number,
+                    "captured_at": captured_at,
+                    "shape": tuple(frame_resized.shape),
+                }
 
     def get_latest(self):
         """Returns (frame, detections, inference_fps) — all safe copies."""
         with self.lock:
             if self._latest_frame is None:
-                return None, [], 0.0
+                return None, [], None, 0.0
             return (
                 self._latest_frame.copy(),
                 list(self._latest_detections),
+                dict(self._latest_frame_info),
                 self._inference_fps,
             )
 
@@ -157,7 +164,9 @@ def main():
     face_recognizer = FaceRecognizer()
     # Pass tts reference so Stream can mute mic while GuideBot is speaking (AEC gate)
     # Pass face_recognizer so /faces API can hot-reload embeddings after add/delete
+    print("[Startup] Initializing stream receiver...")
     stream          = Stream(voice_input=voice_input, face_recognizer=face_recognizer, tts=tts)
+    print("[Startup] Stream receiver ready.")
 
     # Wire TTS → Stream: broadcast spoken text to /ws/tts-feed web clients
     tts.set_broadcast(stream.broadcast_tts_text)
@@ -169,18 +178,30 @@ def main():
         enabled=CONFIG.get("llm_enabled", False),
         auto_start=CONFIG.get("llm_auto_start", True),
         tts_callback=tts.speak,
+        vision_enabled=CONFIG.get("vision_enabled", True),
+        vision_model=CONFIG.get("vision_model", "qwen3-vl:4b-instruct"),
+        vision_timeout=CONFIG.get("vision_timeout", 240.0),
+        vision_frame_dir=CONFIG.get("vision_frame_dir", "logs/vision-frames"),
+        vision_frame_limit=CONFIG.get("vision_frame_limit", 25),
+        vision_image_max_width=CONFIG.get("vision_image_max_width", 512),
     )
     if llm.enabled:
         print(f"[LLM] Conversational assistant ENABLED (model: {llm.model})")
     else:
         print("[LLM] Conversational assistant DISABLED (set LLM_ENABLED=true in .env to activate)")
+    if llm.vision_enabled:
+        print(f"[Vision] Scene description ENABLED (model: {llm.vision_model})")
+    else:
+        print("[Vision] Scene description DISABLED (detector-based fallback remains active)")
 
     inference = InferencePipeline(stream, detector, depth_estimator, decision_engine)
 
     cv2.namedWindow("GuideBot", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("GuideBot", CONFIG["display_width"], CONFIG["display_height"])
 
-    last_fps_update     = 0.0
+    last_fps_update     = time.monotonic()
+    last_received_count = stream.get_received_frame_count()
+    receive_fps_text    = "0.0"
     inf_fps_text        = "0.0"
     frame_width         = CONFIG["display_width"]
     frame_height        = CONFIG["display_height"]
@@ -208,7 +229,7 @@ def main():
             # ------------------------------------------------------------------
             # 2. Display: render latest inferred frame
             # ------------------------------------------------------------------
-            annotated_frame, detections, inf_fps = inference.get_latest()
+            annotated_frame, detections, frame_info, inf_fps = inference.get_latest()
 
             if annotated_frame is None or annotated_frame.size == 0:
                 standby = draw_standby_screen(frame_width, frame_height, stream)
@@ -223,6 +244,9 @@ def main():
                 if (key & 0xFF == ord('q')) or is_window_closed("GuideBot"):
                     break
                 continue
+
+            # Keep an unannotated copy for a vision request. Detection boxes are added below.
+            vision_frame = annotated_frame.copy()
 
             # Draw detection boxes on the frame
             for det in detections:
@@ -314,11 +338,16 @@ def main():
                     tts.speak(response)
                     llm.update_tts_history(response)
                 elif is_scene_query:
-                    # Instant, zero-latency, 100% accurate visual answer from current frame
-                    response = decision_engine.describe_scene(detections, frame_width)
-                    print(f"[GuideBot Speaking] {response}")
-                    tts.speak(response)
-                    llm.update_tts_history(response)
+                    # Vision sees the unannotated camera frame; detector output remains the fallback.
+                    fallback_response = decision_engine.describe_scene(detections, frame_width)
+                    print("[Vision] Scene request routed to local vision model.")
+                    llm.ask_vision(
+                        command,
+                        vision_frame,
+                        frame_info,
+                        fallback_response,
+                        fresh_detections=detections,
+                    )
                 elif is_ocr_query:
                     print("[OCR] Reading current frame...")
                     text_result = ocr_reader.read_frame(annotated_frame)
@@ -339,23 +368,28 @@ def main():
                     if num_words <= 1 and words[0] in {"you", "the", "a", "it", "so", "oh", "yeah", "yes", "no", "uh", "um", "bye"}:
                         continue
                     print(f"[Voice / LLM] Conversational query routed to assistant: '{command}'")
-                    # Pass fresh current detections so LLM sees what camera sees right this instant
-                    llm.ask(command, fresh_detections=detections)
+                    # Pass detections and the exact source-frame metadata to the LLM request.
+                    llm.ask(command, fresh_detections=detections, frame_info=frame_info)
 
             # ------------------------------------------------------------------
-            # FPS Overlay: Inference FPS Badge
+            # FPS Overlay: compact receive and inference diagnostics
             # ------------------------------------------------------------------
-            curr_time = time.time()
-            if curr_time - last_fps_update >= 0.3:
+            curr_time = time.monotonic()
+            elapsed = curr_time - last_fps_update
+            if elapsed >= 0.3:
+                received_count = stream.get_received_frame_count()
+                receive_fps_text = f"{(received_count - last_received_count) / elapsed:.1f}"
                 inf_fps_text = f"{inf_fps:.1f}"
+                last_received_count = received_count
                 last_fps_update = curr_time
 
-            # Draw dark background badge for contrast
-            cv2.rectangle(annotated_frame, (8, 6), (185, 38), (20, 20, 20), -1)
-            cv2.rectangle(annotated_frame, (8, 6), (185, 38), (80, 80, 80), 1)
+            cv2.rectangle(annotated_frame, (8, 6), (145, 46), (20, 20, 20), -1)
+            cv2.rectangle(annotated_frame, (8, 6), (145, 46), (80, 80, 80), 1)
 
-            cv2.putText(annotated_frame, f"Inference: {inf_fps_text} fps",
-                        (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(annotated_frame, f"Recv: {receive_fps_text} fps",
+                        (14, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 255, 180), 1)
+            cv2.putText(annotated_frame, f"Infer: {inf_fps_text} fps",
+                        (14, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1)
 
             if annotated_frame is not None and getattr(annotated_frame, "size", 0) > 0 and len(annotated_frame.shape) == 3 and annotated_frame.shape[0] > 0 and annotated_frame.shape[1] > 0:
                 cv2.imshow("GuideBot", annotated_frame)

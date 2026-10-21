@@ -11,6 +11,7 @@ CONFIG = {
     "stream_mode": "push_receiver",
     "receiver_host": "0.0.0.0",
     "receiver_port": 8000,
+    "stream_lan_host": os.getenv("STREAM_LAN_HOST", "").strip(),
     "stream_auth_token": os.getenv("STREAM_AUTH_TOKEN", "guidebot_secret_token"),
     # When False (default) or unset: server always forces VGA (640x480) — best detection quality.
     # When True: ESP32 is allowed to auto-downgrade to QVGA on slow/congested networks.
@@ -61,4 +62,12 @@ CONFIG = {
     "llm_model": os.getenv("LLM_MODEL", "llama3.2:1b"),
     "llm_url": os.getenv("LLM_URL", "http://127.0.0.1:11434"),
     "llm_timeout": float(os.getenv("LLM_TIMEOUT", "25.0")),
+
+    # Local Vision Scene Description Settings (Ollama vision model)
+    "vision_enabled": os.getenv("VISION_ENABLED", "true").strip().lower() in ("1", "true", "yes"),
+    "vision_model": os.getenv("VISION_MODEL", "qwen3-vl:4b-instruct"),
+    "vision_timeout": float(os.getenv("VISION_TIMEOUT", "240")),
+    "vision_frame_dir": os.getenv("VISION_FRAME_DIR", "logs/vision-frames"),
+    "vision_frame_limit": int(os.getenv("VISION_FRAME_LIMIT", "25")),
+    "vision_image_max_width": int(os.getenv("VISION_IMAGE_MAX_WIDTH", "512")),
 }

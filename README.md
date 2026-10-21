@@ -48,7 +48,7 @@ Python 3.11, PyTorch (CUDA), OpenCV, Ultralytics YOLO, MiDaS, OpenAI Whisper, Ea
 ### 1. Clone & Navigate to Folder
 Open a terminal (Command Prompt or PowerShell) and navigate into the project directory:
 ```cmd
-cd C:\Users\nathan\DevLobo\Guidebot
+cd \path\to\Guidebot
 ```
 
 ### 2. Create Virtual Environment
@@ -126,19 +126,31 @@ LLM_ENABLED=true
 LLM_MODEL=llama3.2:3b or llama3.2:1b
 LLM_URL=http://127.0.0.1:11434
 LLM_TIMEOUT=25.0
+
+# Local vision scene description (requires: ollama pull qwen3-vl:4b-instruct)
+VISION_ENABLED=true
+VISION_MODEL=qwen3-vl:4b-instruct
+VISION_TIMEOUT=240
+VISION_FRAME_DIR=logs/vision-frames
+VISION_FRAME_LIMIT=25
+VISION_IMAGE_MAX_WIDTH=512
 ```
 
 ---
 
 ### 6. Network & Tunnel Setup (Port 8000)
-GuideBot runs an internal video receiver on port `8000`. To receive video over mobile hotspots or across the internet, choose **one** of the tunneling options below:
+GuideBot runs an internal receiver on port `8000`. The ESP32 connects to the configured tunnel URL for commands and audio. The server advertises its LAN IPv4 address over that connection; when the ESP32 can reach that address, camera frames go directly to the server over the LAN. If it cannot, frames fall back to the tunnel. Thus, direct streaming requires the ESP32 and server to be reachable on the same LAN; it does not bypass routing between different networks.
+
+If the server has multiple network adapters, set `STREAM_LAN_HOST` in `.env` to the IPv4 address reachable by the ESP32. Otherwise it is detected from the server's default route. Ensure port `8000` is allowed through the host firewall.
+
+The ESP32 remembers up to five Wi-Fi profiles entered through its setup portal or the `/esp` dashboard. It checks the Python server with heartbeats; after 35 seconds without a response, it tries the other saved networks (up to 15 seconds to associate with each) and enables the `GuideBot-Setup` hotspot if none restore communication. Wi-Fi station and setup hotspot can run together, so the device can remain connected to a network while exposing the setup page at `http://192.168.4.1`.
 
 #### Option A: Cloudflare Tunnel (Recommended for permanent domains)
 1. In Cloudflare Zero Trust / Cloudflare Tunnels dashboard, add a Public Hostname to your tunnel:
    - **Service Type:** Select `HTTP` *(Cloudflare automatically upgrades WebSockets over HTTP)*
    - **URL:** `localhost:8000`
    - **Subdomain:** e.g. `stream.yourdomain.com`
-2. Use this subdomain in your ESP32 configuration.
+2. Use this subdomain in your ESP32 configuration. This connection remains active for device commands and audio, and carries video only when direct LAN streaming is unavailable.
 
 #### Option B: VS Code Built-in Port Tunneling ("VS Code Ports")
 If you don't have a Cloudflare domain, you can use VS Code's free built-in tunneling:
@@ -147,12 +159,10 @@ If you don't have a Cloudflare domain, you can use VS Code's free built-in tunne
 3. Click **Forward a Port** and enter `8000`.
 4. Right-click the forwarded port row -> **Port Visibility** -> change from *Private* to **Public**.
 5. Copy the generated **Forwarded Address** (e.g. `xxxx-8000.inc1.devtunnels.ms`).
-6. Use that host name as the server host in your ESP32 configuration.
+6. Use that host name as the server host in your ESP32 configuration. As with Cloudflare, the tunnel is used for discovery, commands, audio, and video fallback.
 
-#### Option C: Local LAN Mode (No internet required)
-If you are testing on the same local Wi-Fi without any tunnel:
-1. In `config.py`, set `"stream_mode": "pull"`.
-2. Set `"stream_url": "http://<ESP32_IP>/stream"`.
+#### Option C: LAN-only setup (No tunnel)
+If both devices are on the same local Wi-Fi and you do not need remote commands/audio, you can set the ESP32 server host to the computer's LAN address directly. The tunnel-based discovery and fallback described above will not be used.
 
 ---
 
@@ -214,12 +224,21 @@ ollama pull llama3.2:3b
 ```
 *(For machines with limited VRAM or CPU-only setups, lighter models like `llama3.2:1b` or `qwen2.5:1.5b` can also be used by setting `LLM_MODEL` in `.env`).*
 
-#### 3. Service Lifecycle
+#### 3. Pull the Vision Model for Scene Descriptions
+Scene-description commands send the current camera frame to a local vision model. Pull it once:
+
+```cmd
+ollama pull qwen3-vl:4b-instruct
+```
+
+The exact JPEG sent to Ollama is saved in `logs/vision-frames/`. To keep CPU-only descriptions responsive, frames wider than 512 pixels are downscaled before encoding; GuideBot logs the source and transmitted dimensions. It retains the newest 25 snapshots and logs the frame ID, file path, size, and hash in `guidebot.log`.
+
+#### 4. Service Lifecycle
 - **Automatic:** If `LLM_AUTO_START=true` (the default), GuideBot automatically checks if Ollama is listening at `http://127.0.0.1:11434`. If not, it launches `ollama serve` in the background.
 - **Manual (Optional):** You can also start the Ollama desktop application or run `ollama serve` in a dedicated terminal before starting GuideBot.
 - **Graceful Fallback:** If Ollama is not installed or unreachable, GuideBot logs a clear warning and falls back to rule-based keyword commands without crashing.
 
-#### 4. Configure `.env`
+#### 5. Configure `.env`
 Verify your settings in `.env`:
 ```env
 LLM_ENABLED=true
@@ -227,6 +246,12 @@ LLM_AUTO_START=true
 LLM_MODEL=llama3.2:3b
 LLM_URL=http://127.0.0.1:11434
 LLM_TIMEOUT=25.0
+VISION_ENABLED=true
+VISION_MODEL=qwen3-vl:4b-instruct
+VISION_TIMEOUT=240
+VISION_FRAME_DIR=logs/vision-frames
+VISION_FRAME_LIMIT=25
+VISION_IMAGE_MAX_WIDTH=512
 ```
 
 ---
